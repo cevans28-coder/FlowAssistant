@@ -69,6 +69,10 @@ function ensureUserTriggers_() {
   // Every 10 minutes: inactivity watchdog
   ScriptApp.newTrigger('watchdog_heartbeat_10min').timeBased().everyMinutes(10).create();
 
+// Nightly archive (once per user install; it’s idempotent if multiple users install)
+ScriptApp.newTrigger('archiveOldRows_').timeBased().everyDays(1).atHour(2).create();
+
+
   // Installable onEdit bound to the MASTER spreadsheet (A1 date dropdown filters)
   if (!MASTER_SPREADSHEET_ID || MASTER_SPREADSHEET_ID === 'PASTE_MASTER_ID_HERE') {
     throw new Error('MASTER_SPREADSHEET_ID is not set in 00_constants.gs');
@@ -206,3 +210,4 @@ function adminForceLogoutAll(reasonOpt) {
   list.forEach(u => { try { adminForceLogout(u.analyst_id, msg); } catch(e){} });
   return { ok:true, count:list.length };
 }
+
