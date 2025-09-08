@@ -1,0 +1,39 @@
+/**
+ * One-off backfill: recompute/populate LIVE values for all analysts.
+ * Safe to run multiple times. Returns a count of rows refreshed.
+ */
+function refreshLiveForAll() {
+  const ss = master_();
+  const sh = ss.getSheetByName(SHEETS.ANALYSTS);
+  if (!sh || sh.getLastRow() < 2) return { ok:false, refreshed:0, msg:'No analysts on Master → Analysts' };
+
+  const vals = sh.getDataRange().getValues();
+  const idx = indexMap_(vals[0]);
+  let n = 0;
+  for (let r = 1; r < vals.length; r++) {
+    const id = String(vals[r][idx['analyst_id']] || '').trim().toLowerCase();
+    if (!id) continue;
+    try {
+      // Uses your existing function that writes to Live
+      refreshLiveFor_(id);
+      n++;
+    } catch(e) {
+      // ignore row errors; keep going
+    }
+  }
+  return { ok:true, refreshed:n };
+  try { updateLiveKPIsFor_(id); } catch(e) {}
+}
+
+function rebuildLiveKPIsForAllToday_(){
+  const ss = master_();
+  const a = ss.getSheetByName(SHEETS.ANALYSTS);
+  if (!a || a.getLastRow() < 2) return;
+  const vals = a.getDataRange().getValues();
+  const idx = indexMap_(vals[0]);
+  for (let r=1; r<vals.length; r++){
+    const id = String(vals[r][idx['analyst_id']]||'').trim();
+    if (!id) continue;
+    try { updateLiveKPIsFor_(id); } catch(e) {}
+  }
+}
