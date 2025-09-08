@@ -1,0 +1,218 @@
+/** =========================================
+ * 101_Notifications.gs (QA Tracker)
+ * Centralised lightweight notification log
+ * =========================================
+ * Sheet: "Notifications" (auto-created)
+ * Columns:
+ * id | ts_utc | type | audience | target_email | from_email
+ * ref | title | message | status | meta_json
+ */
+
+function getMasterSS_() {
+  var id = PropertiesService.getScriptProperties().getProperty('MASTER_SHEET_ID');
+  if (id) return SpreadsheetApp.openById(id);
+  var ss = SpreadsheetApp.getActive();
+  if (!ss) throw new Error('MASTER_SHEET_ID not set and no active spreadsheet. Run setMasterSheetId(id).');
+  return ss;
+}
+function setMasterSheetId(id) {
+  PropertiesService.getScriptProperties().setProperty('MASTER_SHEET_ID', id);
+  return { ok:true, id:id };
+}
+
+var Notifications = (function () {
+  var SHEET_NAME = 'Notifications';
+  var HEAD = [
+    'id','ts_utc','type','audience','target_email','from_email',
+    'ref','title','message','status','meta_json'
+  ];
+
+  // ---------- utils ----------
+  function ss_(){ return getMasterSS_(); }
+  function nowUtc_(){ return new Date().toISOString(); }
+  function sheet_(){
+    var sh = ss_().getSheetByName(SHEET_NAME);
+    if (!sh) {
+      sh = ss_().insertSheet(SHEET_NAME);
+      sh.getRange(1,1,1,HEAD.length).setValues([HEAD]);
+      sh.setFrozenRows(1);
+    } else {
+      var width = Math.max(HEAD.length, sh.getLastColumn() || 1);
+      var row = sh.getRange(1,1,1,width).getValues()[0];
+      for (var i=0;i<HEAD.length;i++){
+        if (String(row[i]||'') !== HEAD[i]) sh.getRange(1,i+1).setValue(HEAD[i]);
+      }
+    }
+    return sh;
+  }
+  function asMap_(row){
+    var m = {};
+    for (var i=0;i<HEAD.length;i++) m[HEAD[i]] = (row[i]===undefined?'':row[i]);
+    return m;
+  }
+  function email_(){ try { return Session.getActiveUser().getEmail() || ''; } catch(e){ return ''; } }
+  function json_(o){ try { return JSON.stringify(o||{}); } catch(e){ return '{}'; } }
+  function write_(obj){
+    var sh = sheet_();
+    var row = [
+      obj.id || Utilities.getUuid(),
+      obj.ts_utc || nowUtc_(),
+      obj.type || 'INFO',
+      obj.audience || 'ALL',
+      obj.target_email || '',
+      obj.from_email || email_(),
+      obj.ref || '',
+      obj.title || '',
+      obj.message || '',
+      obj.status || 'NEW',
+      json_(obj.meta || obj.meta_json)
+    ];
+    sh.appendRow(row);
+    return { id: row[0], ref: row[6], status: row[9] };
+  }
+
+  // ---------- public API ----------
+
+  /** Analyst-raised exception -> create canonical exception + TL notification */
+  function createExceptionNotification(payload){
+    payload = payload || {};
+    var exc = Exceptions.createFromAnalyst(payload); // {ref, minutes, status}
+
+    var me = email_();
+    var analystId = String(payload.analyst_id || (me ? me.split('@')[0] : '') || '');
+
+    var title = 'Exception: ' + (payload.category || 'Other') + ' — ' + exc.ref;
+    var body = [
+      'From: ' + (me || 'unknown'),
+      'Analyst ID: ' + (analystId || 'unknown'),
+      'Date: ' + (payload.date_iso || '(derived)'),
+      'Window: ' + (payload.start_ts || '?') + ' → ' + (payload.end_ts || '?'),
+      'Minutes: ' + (exc.minutes || 0),
+      'Reason: ' + (payload.reason || '(none)'),
+      'Ref: ' + exc.ref
+    ].join('\n');
+
+    var meta = {
+      kind: 'exception',
+      ref: exc.ref,
+      minutes: exc.minutes,
+      category: payload.category || 'Other',
+      date_iso: payload.date_iso || '',
+      start_ts: payload.start_ts || '',
+      end_ts: payload.end_ts || '',
+      team: payload.team || '',
+      org: payload.org || '',
+      leads: payload.leads || null,
+      reason: payload.reason || '',
+      from_analyst_id: analystId
+    };
+
+    var n = write_({
+      type: 'EXCEPTION',
+      audience: 'TL',
+      target_email: '',
+      from_email: me,
+      ref: exc.ref,
+      title: title,
+      message: body,
+      status: 'NEW',
+      meta: meta
+    });
+
+    return { ok:true, ref: exc.ref, minutes: exc.minutes, notification_id: n.id };
+  }
+
+  /**
+   * params: { audience:'TL'|'ANALYST'|'ALL', target_email?, status?('NEW'|'READ'|'ARCHIVED'|'ANY'), sinceDays? }
+   * returns: { items:[...] } and we HOIST meta fields to top-level for the UI.
+   */
+  function list(params){
+    params = params || {};
+    var a = (params.audience || 'TL').toUpperCase();
+    var status = (params.status || 'NEW').toUpperCase();
+    var sinceDays = Number(params.sinceDays || 14);
+    var cutoff = new Date(); cutoff.setDate(cutoff.getDate() - sinceDays);
+
+    var sh = sheet_();
+    var last = sh.getLastRow();
+    if (last < 2) return { items: [] };
+
+    var vals = sh.getRange(2,1,last-1,HEAD.length).getValues();
+    var out = [];
+    for (var i=0;i<vals.length;i++){
+      var m = asMap_(vals[i]);
+      if (a !== 'ALL' && m.audience !== a) continue;
+      if (params.target_email && m.target_email.toLowerCase() !== String(params.target_email).toLowerCase()) continue;
+      if (status !== 'ANY' && m.status !== status) continue;
+      if (new Date(m.ts_utc || vals[i][1]) < cutoff) continue;
+
+      // Parse meta and HOIST fields the UI needs
+      var meta = {};
+      try { meta = JSON.parse(m.meta_json || '{}'); } catch(e){}
+      m.from_analyst_id = meta.from_analyst_id || (m.from_email ? String(m.from_email).split('@')[0] : '');
+      m.date_iso = meta.date_iso || m.date_iso || '';
+      m.start_ts = meta.start_ts || m.start_ts || '';
+      m.end_ts = meta.end_ts || m.end_ts || '';
+      m.minutes = meta.minutes != null ? meta.minutes : m.minutes;
+      m.category = meta.category || m.category || '';
+      m.reason = meta.reason || m.reason || '';
+
+      out.push(m);
+    }
+    out.sort(function(x,y){ return String(y.ts_utc).localeCompare(String(x.ts_utc)); });
+    return { items: out };
+  }
+
+  function markRead(id){
+    var sh = sheet_(); var last = sh.getLastRow();
+    if (last < 2) return { ok:false, error:'no data' };
+    var vals = sh.getRange(2,1,last-1,HEAD.length).getValues();
+    for (var r=0;r<vals.length;r++){
+      if (String(vals[r][0]) === String(id)) {
+        vals[r][9] = 'READ';
+        sh.getRange(r+2,1,1,HEAD.length).setValues([vals[r]]);
+        return { ok:true, id:id, status:'READ' };
+      }
+    }
+    return { ok:false, error:'not found', id:id };
+  }
+
+  function archive(id){
+    var sh = sheet_(); var last = sh.getLastRow();
+    if (last < 2) return { ok:false, error:'no data' };
+    var vals = sh.getRange(2,1,last-1,HEAD.length).getValues();
+    for (var r=0;r<vals.length;r++){
+      if (String(vals[r][0]) === String(id)) {
+        vals[r][9] = 'ARCHIVED';
+        sh.getRange(r+2,1,1,HEAD.length).setValues([vals[r]]);
+        return { ok:true, id:id, status:'ARCHIVED' };
+      }
+    }
+    return { ok:false, error:'not found', id:id };
+  }
+
+  return {
+    createExceptionNotification: createExceptionNotification,
+    createInfo: createInfo,
+    createNudge: createNudge,
+    list: list,
+    markRead: markRead,
+    archive: archive
+  };
+})();
+
+/* Thin wrappers for client */
+function createExceptionNotification(payload){ return Notifications.createExceptionNotification(payload); }
+function createInfo(targetEmail, title, message, meta){ return Notifications.createInfo(targetEmail, title, message, meta); }
+function createNudge(toAnalystEmail, reason, meta){ return Notifications.createNudge(toAnalystEmail, reason, meta); }
+function listNotifications(params){ return Notifications.list(params); }
+function markNotificationRead(id){ return Notifications.markRead(id); }
+function archiveNotification(id){ return Notifications.archive(id); }
+
+// Optional prefixed variants
+function Notifications_createExceptionNotification(payload){ return Notifications.createExceptionNotification(payload); }
+function Notifications_createInfo(targetEmail, title, message, meta){ return Notifications.createInfo(targetEmail, title, message, meta); }
+function Notifications_createNudge(toAnalystEmail, reason, meta){ return Notifications.createNudge(toAnalystEmail, reason, meta); }
+function Notifications_list(params){ return Notifications.list(params); }
+function Notifications_markRead(id){ return Notifications.markRead(id); }
+function Notifications_archive(id){ return Notifications.archive(id); }
