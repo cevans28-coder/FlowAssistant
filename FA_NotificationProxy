@@ -1,0 +1,14 @@
+/**
+ * Flow Assistant → QA Tracker proxy for exceptions.
+ * Ensures the client calls a top-level function (google.script.run requirement).
+ */
+function faSubmitException(payload) {
+  payload = payload || {};
+  // If you have a session layer, enrich payload here (analyst_id, team, etc.)
+  // Example:
+  // var who = Sessions.getByToken(payload.token);
+  // if (who && who.analyst_id) payload.analyst_id = who.analyst_id;
+
+  // Forward to QA Tracker library (update the identifier if yours differs)
+  return QATracker.createExceptionNotification(payload);
+}
