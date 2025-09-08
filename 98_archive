@@ -1,0 +1,63 @@
+/******************************************************
+ * 98_archive.gs — nightly archive of old rows
+ * Moves rows older than N days to an Archive spreadsheet or tab.
+ ******************************************************/
+
+// CONFIG: how many days to keep in the active Master
+var ARCHIVE_KEEP_DAYS = 90;
+
+// Optional: set a separate spreadsheet ID for archive storage.
+// If blank, we archive into sibling tabs in the same Master.
+var ARCHIVE_SPREADSHEET_ID = ''; // e.g. '1Abc...'; leave '' to keep in same file.
+
+function archiveOldRows_() {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - ARCHIVE_KEEP_DAYS);
+  const cutoffISO = Utilities.formatDate(cutoff, TZ, 'yyyy-MM-dd');
+
+  const ss = master_();
+  const archiveSS = ARCHIVE_SPREADSHEET_ID ? SpreadsheetApp.openById(ARCHIVE_SPREADSHEET_ID) : ss;
+
+  // Tables to archive: date in column named 'date'
+  const tables = [
+    { name: SHEETS.STATUS_LOGS, archiveName: SHEETS.STATUS_LOGS + '_Archive' },
+    { name: SHEETS.CHECK_EVENTS, archiveName: SHEETS.CHECK_EVENTS + '_Archive' },
+    { name: SHEETS.CAL_PULL, archiveName: SHEETS.CAL_PULL + '_Archive' },
+    { name: SHEETS.DAILY, archiveName: SHEETS.DAILY + '_Archive' }
+  ];
+
+  tables.forEach(t => {
+    const sh = ss.getSheetByName(t.name);
+    if (!sh || sh.getLastRow() < 2) return;
+
+    const v = sh.getDataRange().getValues();
+    const hdr = v[0].map(String);
+    const idx = indexMap_(hdr);
+    if (idx['date'] == null) return;
+
+    const toMove = [];
+    for (let r=1; r<v.length; r++) {
+      const dateStr = String(v[r][idx['date']]||'').trim();
+      if (dateStr && dateStr < cutoffISO) toMove.push(v[r]);
+    }
+    if (!toMove.length) return;
+
+    // Ensure archive tab exists with same headers
+    let aSh = archiveSS.getSheetByName(t.archiveName);
+    if (!aSh) aSh = archiveSS.insertSheet(t.archiveName);
+    if (aSh.getLastRow() === 0) {
+      aSh.getRange(1, 1, 1, hdr.length).setValues([hdr]);
+      aSh.setFrozenRows(1);
+    }
+
+    aSh.getRange(aSh.getLastRow()+1, 1, toMove.length, hdr.length).setValues(toMove);
+
+    // Rewrite original sheet keeping only recent rows
+    const keep = [hdr].concat(v.slice(1).filter(r => {
+      const d = String(r[idx['date']]||'').trim();
+      return !(d && d < cutoffISO);
+    }));
+    sh.clearContents();
+    sh.getRange(1,1,keep.length,keep[0].length).setValues(keep);
+  });
+}
