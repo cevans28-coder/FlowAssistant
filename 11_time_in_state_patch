@@ -1,0 +1,212 @@
+/******************************************************
+ * 11_time_in_state_patch.gs
+ * Robust header fixer + batch backfill for StatusLogs.time_in_state
+ * Safe to run more than once.
+ *
+ * Depends on: master_(), SHEETS, Session.getScriptTimeZone()
+ ******************************************************/
+
+/* --------------- small local helpers (self-contained) --------------- */
+function _sl_norm(s){ return String(s||'').replace(/\u00A0/g,' ').trim(); }
+function _sl_key(s){ return _sl_norm(s).toLowerCase(); }
+function _sl_toISO(d, tz){
+  if (d instanceof Date && !isNaN(d)) return Utilities.formatDate(d, tz||'UTC', 'yyyy-MM-dd');
+  // also accept strings like '2025-09-05'
+  const t = Date.parse(String(d));
+  if (!isNaN(t)) return Utilities.formatDate(new Date(t), tz||'UTC', 'yyyy-MM-dd');
+  return '';
+}
+
+/** Find StatusLogs sheet: exact SHEETS.STATUS_LOGS, else fuzzy “statuslogs”. */
+function _sl_getSheetFlexible_(){
+  const ss = master_();
+  let sh = ss.getSheetByName(SHEETS.STATUS_LOGS);
+  if (sh) return sh;
+  // fuzzy fallback
+  const target = 'statuslogs';
+  const cand = ss.getSheets().find(s => _sl_key(s.getName()) === target || _sl_key(s.getName()).startsWith(target));
+  return cand || ss.insertSheet(SHEETS.STATUS_LOGS);
+}
+
+/** Get header row 1 as normalized strings. */
+function _sl_getHeaders_(sh){
+  const lastCol = Math.max(1, sh.getLastColumn());
+  const vals = sh.getRange(1,1,1,lastCol).getValues();
+  if (!vals || !vals.length) return [];
+  return (vals[0] || []).map(v => _sl_norm(v));
+}
+
+/** Write header array to row 1 and freeze. */
+function _sl_setHeaders_(sh, hdrArr){
+  sh.getRange(1,1,1,Math.max(1,hdrArr.length)).setValues([hdrArr]);
+  sh.setFrozenRows(1);
+}
+
+/** Build map: normalized header -> 0-based index. */
+function _sl_indexMap_(hdr){
+  const m={}; hdr.forEach((h,i)=>{ if (h) m[_sl_key(h)] = i; }); return m;
+}
+
+/* ------------------ 1) Ensure required headers ------------------ */
+function ensureStatusLogsReady_robust(){
+  const REQUIRED = ['timestamp_iso','date','analyst_id','state','source','note','time_in_state'];
+
+  const sh = _sl_getSheetFlexible_();
+  let hdr = _sl_getHeaders_(sh);
+
+  // new or empty header row → write required
+  if (hdr.length === 0 || hdr.every(h => h==='')){
+    _sl_setHeaders_(sh, REQUIRED);
+    return sh;
+  }
+
+  // append missing required columns (non-destructive)
+  const have = _sl_indexMap_(hdr);
+  let changed=false;
+  REQUIRED.forEach(r=>{
+    if (have[_sl_key(r)] == null){ hdr.push(r); changed=true; }
+  });
+  if (changed) _sl_setHeaders_(sh, hdr);
+  return sh;
+}
+
+/* ------------------ 2) Batch backfill for a date range ------------------ */
+function Backfill_TimeInState_Range_Robust(startISO, endISO){
+  const tz = Session.getScriptTimeZone();
+
+  // Build inclusive date set
+  function _dateList(sISO,eISO){
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(sISO||'')) ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(String(eISO||''))) return [];
+    const out=[], s=new Date(sISO+'T00:00:00'); const e=new Date(eISO+'T00:00:00');
+    if (!(s instanceof Date) || isNaN(s) || !(e instanceof Date) || isNaN(e) || e<s) return [];
+    for (let d=new Date(s); d<=e; d.setDate(d.getDate()+1)){
+      out.push(Utilities.formatDate(d, tz, 'yyyy-MM-dd'));
+    }
+    return out;
+  }
+  const dates = _dateList(startISO, endISO);
+  if (!dates.length) return { ok:false, reason:'Invalid date range', startISO, endISO };
+
+  const sh = ensureStatusLogsReady_robust();
+
+  // Read data once
+  const rng = sh.getDataRange();
+  const vals = rng.getValues();
+  if (!vals || vals.length < 2){
+    Logger.log('StatusLogs has no data rows.');
+    return { ok:true, updated:0, rows:0, startISO, endISO };
+  }
+  const hdr = _sl_getHeaders_(sh);
+  const idx = _sl_indexMap_(hdr);
+
+  const c_ts = idx['timestamp_iso'];
+  const c_date = idx['date'];
+  const c_aid = idx['analyst_id'];
+  let c_tis = idx['time_in_state']; // 0-based
+
+  if (c_ts == null || c_date == null || c_aid == null){
+    throw new Error('StatusLogs missing required columns. Headers = '+JSON.stringify(hdr));
+  }
+
+  // If new column, it will be appended at end
+  const writeColA1 = (c_tis == null) ? (hdr.length + 1) : (c_tis + 1);
+
+  // Build date set for fast lookup
+  const dateSet = new Set(dates);
+
+  // Build a row model for all rows in the window
+  const rows = [];
+  for (let r=1; r<vals.length; r++){
+    const row = vals[r];
+    // normalize date (string or Date)
+    const dateISO = _sl_toISO(row[c_date], tz);
+    if (!dateISO || !dateSet.has(dateISO)) continue;
+
+    const tsMillis = Date.parse(String(row[c_ts]||''));
+    if (isNaN(tsMillis)) continue;
+
+    const aid = _sl_key(row[c_aid]);
+    rows.push({ r, aid, dateISO, ts: tsMillis });
+  }
+
+  // Nothing matched the date range
+  if (!rows.length){
+    Logger.log('No rows in range %s..%s', startISO, endISO);
+    return { ok:true, updated:0, rows_in_range:0, startISO, endISO };
+  }
+
+  // Sort by analyst, then date, then timestamp
+  rows.sort((a,b)=>{
+    if (a.aid < b.aid) return -1; if (a.aid > b.aid) return 1;
+    if (a.dateISO < b.dateISO) return -1; if (a.dateISO > b.dateISO) return 1;
+    return a.ts - b.ts;
+  });
+
+  // Prepare the output column (2..N)
+  const out = new Array(vals.length-1).fill(''); // aligns to data rows
+  const todayISO = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+  const now = new Date();
+
+  // Walk the sorted rows; for each row, find the next row with same (aid,date)
+  for (let i=0; i<rows.length; i++){
+    const cur = rows[i];
+    let endTs = null;
+
+    if (i+1 < rows.length &&
+        rows[i+1].aid === cur.aid &&
+        rows[i+1].dateISO === cur.dateISO){
+      endTs = rows[i+1].ts;
+    } else {
+      // last change for that analyst on that date → end at 23:59:59 or now if today
+      endTs = (cur.dateISO === todayISO)
+        ? now.getTime()
+        : Date.parse(cur.dateISO + 'T23:59:59');
+    }
+
+    const mins = Math.max(0, Math.round((endTs - cur.ts)/60000));
+    out[cur.r-1] = mins; // cur.r is 1-based index in vals; out is 0-based for data rows
+  }
+
+  // Ensure write column exists (header)
+  if (c_tis == null){
+    const newHdr = hdr.slice(); newHdr.push('time_in_state');
+    _sl_setHeaders_(sh, newHdr);
+  }
+
+  // Batch write
+  const colValues = out.map(v => [v]);
+  sh.getRange(2, writeColA1, colValues.length, 1).setValues(colValues);
+
+  Logger.log('Backfill complete. Rows scanned: %s; In range: %s; Updated: %s; Wrote column: %s',
+             vals.length-1, rows.length, colValues.filter(x=>x[0]!=='' && x[0]!==null).length, writeColA1);
+
+  return {
+    ok: true,
+    startISO, endISO,
+    rows_scanned: vals.length-1,
+    rows_in_range: rows.length,
+    updated: colValues.filter(x=>x[0]!=='' && x[0]!==null).length
+  };
+}
+
+/* ------------------ 3) One-click helpers ------------------ */
+function Backfill_TimeInState_Last7Days_Robust(){
+  const tz = Session.getScriptTimeZone();
+  const today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+  const start = Utilities.formatDate(new Date(Date.now()-6*24*60*60*1000), tz, 'yyyy-MM-dd');
+  return Backfill_TimeInState_Range_Robust(start, today);
+}
+
+/** Alias for convenience (as requested earlier). */
+function Fix_StatusLogs_AddTimeInState_And_Backfill_Last7Days(){
+  return Backfill_TimeInState_Last7Days_Robust();
+}
+
+/* ------------------ 4) Quick inspector (optional) ------------------ */
+function Inspect_StatusLogs_Quick(){
+  const sh = ensureStatusLogsReady_robust();
+  const hdr = _sl_getHeaders_(sh);
+  Logger.log('StatusLogs sheet: %s | headers: %s | rows: %s',
+             sh.getName(), JSON.stringify(hdr), Math.max(0, sh.getLastRow()-1));
+}
