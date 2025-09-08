@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <base target="_top">
+  <title>Flow TL Console</title>
+
+  <!-- Starling brand-safe overrides (keeps your tl.css intact) -->
+  <style>
+    :root{
+      /* Starling primary purple + accent teal */
+      --brand:#6c2bd9; /* main purple */
+      --accent:#00c2a8; /* teal accent */
+      --brand-2:var(--accent);
+    }
+    /* Ensure status dots render perfectly circular everywhere */
+    .dot{ width:14px; height:14px; border-radius:999px; }
+
+    /* Notification badge (if not defined in tl.css) */
+    .badge{
+      display:inline-flex; align-items:center; justify-content:center;
+      padding:2px 8px; border-radius:999px; font-weight:700; font-size:12px;
+      border:1px solid var(--line, #e5e7eb); background:#fff; color:#333;
+    }
+    .badge.accent{ border-color:transparent; background:var(--brand); color:#fff; }
+    .badge.ok{ border-color:transparent; background:var(--accent); color:#fff; }
+
+    /* Bell button tweaks */
+    .icon-btn{
+      border:1px solid var(--line,#e5e7eb);
+      background:#fff; border-radius:10px; padding:6px 10px;
+      display:inline-flex; align-items:center; justify-content:center; gap:8px;
+      cursor:pointer; user-select:none;
+    }
+    .icon-btn:hover{ background:#fafafa; }
+    .bell{
+      width:18px; height:18px; display:inline-block;
+    }
+    .bell svg{ display:block; width:18px; height:18px; }
+  </style>
+
+  <!-- Your existing styles live here -->
+  <?!= include('tl.css'); ?>
+</head>
+<body>
+  <header>
+    <div class="title"><span class="brandDot"></span> Flow TL Console</div>
+    <div class="row">
+      <input id="dateInput" type="date" />
+      <button id="btnRefresh" class="primary">Refresh</button>
+      <span id="statusMsg" class="small"></span>
+
+      <!-- Notification bell (with unread badge) -->
+      <button id="btnNotify" class="icon-btn" title="Notifications" style="margin-left:8px; position:relative">
+        <span class="bell" aria-hidden="true">
+          <!-- stroke uses currentColor (inherits brand-friendly text color) -->
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M15 17h5l-1.4-1.4A2 2 0 0 1 18 14.2V11a6 6 0 0 0-12 0v3.2c0 .5-.2 1-.6 1.4L4 17h5m6 0a3 3 0 1 1-6 0" />
+          </svg>
+        </span>
+        <span id="notifyBadge"
+              class="badge accent"
+              style="display:none; position:absolute; top:-6px; right:-6px; transform:translate(25%, -25%); min-width:22px; justify-content:center">
+          0
+        </span>
+      </button>
+
+      <!-- NEW: Notifications history filter -->
+      <select id="notifyFilter" class="small" style="margin-left:8px">
+        <option value="OPEN" selected>Open</option>
+        <option value="ALL">All</option>
+      </select>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <!-- Main tabs -->
+    <div class="maintabs" style="margin-bottom:8px">
+      <button id="tabLive" class="tab active">Live View</button>
+      <button id="tabCompareMain" class="tab">Compare</button>
+      <button id="tabQuotaMain" class="tab">Quota Planner</button>
+    </div>
+
+    <!-- Alerts -->
+    <div id="alert" class="small"></div>
+
+    <!-- LIVE VIEW -->
+    <section id="liveView">
+      <div class="card">
+        <div class="kpis" id="kpis"></div>
+      </div>
+      <div class="card">
+        <div class="row small" style="margin-bottom:8px;">
+          Click a <b>State</b> to change it. Click an <b>Analyst</b> to open their calendar &amp; stats.
+        </div>
+        <div id="tableMount">Loading…</div>
+      </div>
+    </section>
+
+    <!-- QUOTA PLANNER -->
+    <section id="quotaView" class="hidden">
+      <div class="card">
+        <div id="quotaMount" class="small muted">Loading…</div>
+      </div>
+    </section>
+
+    <!-- COMPARE -->
+    <section id="compareView" class="hidden">
+      <div class="card">
+        <div id="compareMount" class="small muted">Loading…</div>
+      </div>
+    </section>
+  </div>
+
+  <!-- Drawer -->
+  <div id="drawer" class="drawer" aria-hidden="true">
+    <header class="row" style="justify-content:space-between;">
+      <div class="row">
+        <div id="drawerTitle" style="font-weight:800">—</div>
+        <div id="drawerSub" class="small muted">—</div>
+      </div>
+      <button id="btnCloseDrawer" class="xbtn">Close</button>
+    </header>
+    <div class="body">
+      <div class="row" style="justify-content:space-between">
+        <div class="seg" id="rangeSeg">
+          <button data-range="day" class="active">Day</button>
+          <button data-range="week">Week</button>
+          <button data-range="month">Month</button>
+          <button data-range="custom">Custom</button>
+        </div>
+        <div class="row">
+          <input id="rangeStart" type="date">
+          <span>→</span>
+          <input id="rangeEnd" type="date">
+          <button id="btnRangeGo" class="primary">Go</button>
+        </div>
+      </div>
+
+      <div class="tabs">
+        <button id="tabCal" class="active">Calendar</button>
+        <button id="tabStats">Stats</button>
+        <button id="tabQuota">Quota</button>
+      </div>
+
+      <div id="panelCal">
+        <div id="calMount" class="small muted">Loading…</div>
+      </div>
+      <div id="panelStats" class="hidden">
+        <div id="statsMount" class="small muted">Loading…</div>
+      </div>
+      <div id="panelQuota" class="hidden">
+        <div id="quotaMountDrawer" class="small muted">Loading…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- App modules (order matters) -->
+  <?!= include('tl.api'); ?>
+  <?!= include('tl.app'); ?>
+  <?!= include('tl.table'); ?>
+  <?!= include('tl.drawer'); ?>
+  <?!= include('tl.calendar'); ?>
+  <?!= include('tl.stats'); ?>
+  <?!= include('tl.quota'); ?>
+
+  <!-- NEW: sidebar/controller glue (must be before compare so it can listen early) -->
+  <?!= include('tl.sidebar'); ?>
+
+  <?!= include('tl.compare'); ?> <!-- main Compare tab -->
+
+  <!-- Notification Centre (panel + script) -->
+  <div id="notifyPanel" style="display:none;position:fixed;top:58px;right:16px;width:420px;max-width:95vw;max-height:70vh;overflow:auto;background:#fff;border:1px solid var(--line,#eaeaea);border-radius:12px;box-shadow:0 16px 40px rgba(0,0,0,.18);z-index:9999">
+    <div style="padding:10px 12px;border-bottom:1px solid var(--line,#eee);display:flex;align-items:center;justify-content:space-between">
+      <div style="font-weight:800;">Notification Centre</div>
+      <div class="row" style="gap:6px">
+        <button id="btnMarkAllRead" class="xbtn small">Mark all read</button>
+        <button id="btnCloseNotify" class="xbtn">✕</button>
+      </div>
+    </div>
+    <div id="notifyList" style="display:grid;gap:8px;padding:10px 12px"></div>
+    <div id="notifyEmpty" class="small muted" style="display:none;padding:12px">No notifications.</div>
+  </div>
+
+  <script>
+  (function(){
+    function $(s, r){ return (r||document).querySelector(s); }
+    function $$(s, r){ return Array.from((r||document).querySelectorAll(s)); }
+    function fmt(dtISO){ try{ return new Date(dtISO).toLocaleString(); }catch(e){ return dtISO||''; } }
+    function toast(m){ if (window.showToast) showToast(m); else console.log(m); }
+
+    // ===== Global event bridge =====
+    window.addEventListener('tl:open-analyst-drawer', function(ev){
+      var d = (ev && ev.detail) || {};
+      var aId = d.analystId || d.analyst_id || '';
+      var dateISO = d.dateISO || d.date_iso || '';
+      if (window.TL && typeof TL.openAnalystDrawer === 'function') {
+        TL.openAnalystDrawer(aId, dateISO);
+        setTimeout(function(){
+          try{
+            if (window.TL && TL.calendar && typeof TL.calendar.ensureRendered === 'function'){
+              TL.calendar.ensureRendered();
+            }
+          }catch(e){}
+        }, 150);
+      } else if (window.TL && typeof TL.showDrawerForAnalyst === 'function') {
+        TL.showDrawerForAnalyst(aId, dateISO);
+        setTimeout(function(){
+          try{
+            if (window.TL && TL.calendar && typeof TL.calendar.ensureRendered === 'function'){
+              TL.calendar.ensureRendered();
+            }
+          }catch(e){}
+        }, 150);
+      } else {
+        console.warn('[tl.console] No drawer open handler found for', aId, dateISO);
+      }
+    });
+
+    window.addEventListener('tl:apply-exception-ref', function(ev){
+      var d = (ev && ev.detail) || {};
+      var block = d.block || {};
+      var ref = d.ref || '';
+      if (!ref) ref = window.prompt('Enter Exception Ref to apply:', '');
+      if (!ref) return;
+
+      var minutes = Number(d.minutes);
+      if (!minutes && block.start && block.end){
+        try { minutes = Math.max(0, Math.round((Number(block.end) - Number(block.start)) / 60000)); } catch(e){}
+      }
+
+      const runner = google.script.run
+      .withSuccessHandler(function(){
+        toast('Exception applied ✔');
+        if (window.TL && typeof TL.refreshCalendarView === 'function') {
+        TL.refreshCalendarView();
+          } else {
+          window.dispatchEvent(new CustomEvent('tl:refresh-calendar', { detail:{ analystId:block.analyst_id, dateISO:block.date_iso }}));
+      }
+       })
+      .withFailureHandler(function(err){
+          toast('Failed to apply exception: ' + (err && err.message || err));
+           });
+
+        // Prefer bracket to avoid any minifier/proxy quirks
+        runner['tlApplyExceptionRef_v2'](ref, {
+          applied_note: 'Applied on TL Console' + (block.id ? (' (block #'+block.id+')') : ''),
+            cal_block_id: String(block.id || ''),
+            minus_minutes: minutes || undefined
+            });
+        });
+
+    // ===== Notification UI =====
+    function cardHTML(n){
+      var when = (n.start_ts && n.end_ts)
+        ? (new Date(n.start_ts*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) + ' → ' + new Date(n.end_ts*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}))
+        : (n.minutes ? (n.minutes + ' mins') : '(unspecified)');
+      var status = (n.status || 'NEW').toUpperCase();
+
+      return ''+
+      '<div class="card" data-id="'+n.id+'" style="padding:10px;border:1px solid var(--line,#eee);border-radius:10px">' +
+        '<div class="row" style="justify-content:space-between;align-items:center;margin-bottom:6px">' +
+          '<div class="small muted">'+ fmt(n.created_at_iso) +'</div>' +
+          '<span class="badge '+(status==='NEW'?'accent':(status==='ACK'?'':'ok'))+'">'+ status +'</span>' +
+        '</div>' +
+        '<div style="font-weight:700;margin-bottom:4px">'+ (n.category||'EXCEPTION') +' — <span class="muted">Ref:</span> <code style="font-weight:700">'+ (n.ref||'—') +'</code></div>' +
+        '<div class="small" style="margin-bottom:4px"><b>Analyst:</b> '+ (n.from_analyst_id||'') +'</div>' +
+        '<div class="small muted" style="margin-bottom:6px"><b>Date:</b> '+ (n.date_iso||'') +' · <b>Time:</b> '+ when +'</div>' +
+        '<div class="small" style="margin-bottom:8px;white-space:pre-wrap">'+ (n.reason||'(no reason)') +'</div>' +
+        '<div class="row" style="gap:6px;justify-content:flex-end">' +
+          '<button class="xbtn btnOpenCal">Open in Calendar</button>' +
+          '<button class="xbtn btnCopyRef">Copy Ref</button>' +
+          '<button class="primary btnMarkHandled">Mark handled</button>' +
+        '</div>' +
+      '</div>';
+    }
+
+    function refreshBadge(list){
+      var unseen = (list||[]).filter(function(n){ return (n.status||'NEW').toUpperCase()==='NEW'; }).length;
+      var b = document.getElementById('notifyBadge');
+      if (!b) return;
+      if (unseen>0){ b.style.display='inline-flex'; b.textContent=String(unseen); }
+      else { b.style.display='none'; b.textContent='0'; }
+    }
+
+    // ---- Browser push-style notifications (optional) ----
+    var _lastSeenIds = new Set();
+    var _hasAskedPermission = false;
+    function canShowBrowserNotifications(){ return 'Notification' in window; }
+    function askPermissionIfNeeded(cb){
+      if (!canShowBrowserNotifications()) { if (cb) cb(false); return; }
+      if (Notification.permission === 'granted'){ if (cb) cb(true); return; }
+      if (Notification.permission === 'denied'){ if (cb) cb(false); return; }
+      if (_hasAskedPermission){ if (cb) cb(Notification.permission === 'granted'); return; }
+      _hasAskedPermission = true;
+      Notification.requestPermission().then(function(res){ if (cb) cb(res === 'granted'); }).catch(function(){ if (cb) cb(false); });
+    }
+    function showBrowserNotification(n){
+      try{
+        var title = (n.category || 'Flow') + (n.ref ? ' · ' + n.ref : '');
+        var body = (n.reason || '').slice(0, 220) || 'New notification';
+        var note = new Notification(title, { body: body });
+        note.onclick = function(){
+          window.focus();
+          window.dispatchEvent(new CustomEvent('tl:open-analyst-drawer', { detail:{ analystId:n.from_analyst_id, dateISO:n.date_iso }}));
+          try{ google.script.run.tlMarkNotificationRead(n.id); }catch(e){}
+        };
+      }catch(e){}
+    }
+    function handleNewArrivals(list){
+      if (!canShowBrowserNotifications() || Notification.permission!=='granted') return;
+      (list||[]).forEach(function(n){
+        if (!_lastSeenIds.has(n.id)){
+          _lastSeenIds.add(n.id);
+          if (document.getElementById('notifyPanel').style.display === 'none'){ showBrowserNotification(n); }
+        }
+      });
+      if (_lastSeenIds.size > 1000){
+        var keep = new Set();
+        (list || []).slice(-250).forEach(function(n){ keep.add(n.id); });
+        _lastSeenIds = keep;
+      }
+    }
+
+    // ---- MAIN loader supports OPEN vs ALL history ----
+    function loadNotifications(){
+      var filterEl = document.getElementById('notifyFilter');
+      var mode = filterEl ? String(filterEl.value || 'OPEN').toUpperCase() : 'OPEN'; // OPEN | ALL
+      var params = { onlyOpen: (mode!=='ALL'), sinceDays: 180 }; // up to 6 months
+
+      google.script.run
+        .withSuccessHandler(function(list){
+          list = Array.isArray(list) ? list : [];
+          var box = document.getElementById('notifyList');
+          var empty = document.getElementById('notifyEmpty');
+          if (!box || !empty) return;
+
+          refreshBadge(list);
+          askPermissionIfNeeded(function(){ /* no-op */ });
+
+          if (!list.length){
+            box.innerHTML = '';
+            empty.style.display = 'block';
+          } else {
+            empty.style.display = 'none';
+            box.innerHTML = list.map(cardHTML).join('');
+
+            $$('.btnOpenCal', box).forEach(function(btn){
+              btn.addEventListener('click', function(e){
+                var card = e.target.closest('.card'); if (!card) return;
+                var id = card.getAttribute('data-id');
+                var n = list.find(function(x){ return x.id===id; }); if (!n) return;
+                window.dispatchEvent(new CustomEvent('tl:open-analyst-drawer', { detail: { analystId:n.from_analyst_id, dateISO:n.date_iso }}));
+                google.script.run.tlMarkNotificationRead(id);
+              });
+            });
+
+            $$('.btnCopyRef', box).forEach(function(btn){
+              btn.addEventListener('click', function(e){
+                var card = e.target.closest('.card'); if (!card) return;
+                var id = card.getAttribute('data-id');
+                var n = list.find(function(x){ return x.id===id; }); if (!n) return;
+                if (navigator.clipboard && navigator.clipboard.writeText){
+                  navigator.clipboard.writeText(n.ref||'').then(function(){ toast('Reference copied'); });
+                } else {
+                  // Fallback copy
+                  var tmp = document.createElement('textarea');
+                  tmp.value = n.ref || '';
+                  document.body.appendChild(tmp);
+                  tmp.select();
+                  try{ document.execCommand('copy'); toast('Reference copied'); }catch(e){}
+                  document.body.removeChild(tmp);
+                }
+              });
+            });
+
+            $$('.btnMarkHandled', box).forEach(function(btn){
+              btn.addEventListener('click', function(e){
+                var card = e.target.closest('.card'); if (!card) return;
+                var id = card.getAttribute('data-id');
+                google.script.run
+                  .withSuccessHandler(function(){ toast('Marked handled.'); loadNotifications(); })
+                  .withFailureHandler(function(err){ toast('Could not mark handled: ' + (err && err.message || err)); })
+                  .tlMarkNotificationHandled(id);
+              });
+            });
+          }
+
+          handleNewArrivals(list);
+        })
+        .withFailureHandler(function(err){
+          toast('Could not load notifications: ' + (err && err.message || err));
+        })
+        .tlListNotifications(params); // <— pass params (supports history)
+    }
+
+    function togglePanel(force){
+      var p = document.getElementById('notifyPanel');
+      if (!p) return;
+      var show = (typeof force==='boolean') ? force : (p.style.display==='none');
+      p.style.display = show ? 'block' : 'none';
+    }
+    function markAllRead(){
+      google.script.run
+        .withSuccessHandler(loadNotifications)
+        .withFailureHandler(function(err){ toast('Could not mark all read: ' + (err && err.message || err)); })
+        .tlMarkAllNotificationsRead();
+    }
+
+    function init(){
+      var btnN = document.getElementById('btnNotify');
+      if (btnN){ btnN.addEventListener('click', function(){
+        var p = document.getElementById('notifyPanel'); 
+        var willShow = (p && p.style.display==='none');
+        togglePanel(willShow); 
+        if (willShow) loadNotifications();
+      });}
+
+      var btnClose = document.getElementById('btnCloseNotify');
+      if (btnClose){ btnClose.addEventListener('click', function(){ togglePanel(false); }); }
+      var btnAllRead = document.getElementById('btnMarkAllRead');
+      if (btnAllRead){ btnAllRead.addEventListener('click', markAllRead); }
+      var nf = document.getElementById('notifyFilter');
+      if (nf){ nf.addEventListener('change', loadNotifications); }
+
+      // Polling: keep badge fresh + push for new ones (no heavy redraw)
+      setInterval(function(){
+        var params = { onlyOpen:true, sinceDays:14 };
+        google.script.run
+          .withSuccessHandler(function(list){
+            list = Array.isArray(list) ? list : [];
+            refreshBadge(list);
+            handleNewArrivals(list);
+          })
+          .withFailureHandler(function(){ /* ignore */ })
+          .tlListNotifications(params);
+      }, 60000);
+    }
+
+    document.addEventListener('DOMContentLoaded', init);
+  })();
+  </script>
+</body>
+</html>
