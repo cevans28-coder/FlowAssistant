@@ -1,0 +1,164 @@
+/** Utilities */
+function listISOdays_(startISO, endISO, tz) {
+  const out = [];
+  const s = Utilities.parseDate(startISO+' 00:00:00', tz, 'yyyy-MM-dd HH:mm:ss');
+  const e = Utilities.parseDate(endISO+' 00:00:00', tz, 'yyyy-MM-dd HH:mm:ss');
+  const d = new Date(s);
+  while (d <= e) {
+    out.push(Utilities.formatDate(d, tz, 'yyyy-MM-dd'));
+    d.setDate(d.getDate()+1);
+  }
+  return out;
+}
+function clampToDay_(iso, dateISO, tz) {
+  const {start, end} = dayBounds_(dateISO);
+  const d = new Date(iso);
+  return new Date(Math.min(Math.max(d.getTime(), start.getTime()), end.getTime()));
+}
+
+/**
+ * Range timeline (per-day stints + checks), capped to each day and to "now" if the day is today.
+ */
+function getAnalystRangeTimeline(analystId, startISO, endISO) {
+  if (!analystId) throw new Error('Missing analystId');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(startISO) || !/^\d{4}-\d{2}-\d{2}$/.test(endISO)) {
+    throw new Error('Use YYYY-MM-DD for start and end');
+  }
+  const ss = master_();
+  const idNorm = normId_(analystId);
+  const todayISO = toISODate_(new Date());
+
+  const slAll = readRows_(ss.getSheetByName(SHEETS.STATUS_LOGS))
+    .filter(r => r.analyst_id_norm === idNorm && r.date_str >= startISO && r.date_str <= endISO)
+    .sort((a,b)=> a.ts - b.ts);
+
+  const ceAll = readRows_(ss.getSheetByName(SHEETS.CHECK_EVENTS))
+    .filter(r => r.analyst_id_norm === idNorm && r.date_str >= startISO && r.date_str <= endISO);
+
+  const days = listISOdays_(startISO, endISO, TZ).map(dateISO => {
+    const rows = slAll.filter(r=> r.date_str === dateISO);
+    const stints = [];
+    if (rows.length) {
+      for (let i=0;i<rows.length;i++){
+        const cur = rows[i], next = rows[i+1];
+        if (!cur.ts) continue;
+        let s = clampToDay_(cur.ts.toISOString(), dateISO, TZ);
+        let e;
+        if (next && next.ts) e = clampToDay_(next.ts.toISOString(), dateISO, TZ);
+        else {
+          // default to end of day, but cap to "now" if today
+          const endOfDay = Utilities.parseDate(dateISO+' 23:59:59', TZ, 'yyyy-MM-dd HH:mm:ss');
+          const now = new Date();
+          e = (dateISO === todayISO) ? new Date(Math.min(endOfDay.getTime(), now.getTime())) : endOfDay;
+        }
+        if (e > s) stints.push({ state: String(cur.state||'Idle'), start_iso: s.toISOString(), end_iso: e.toISOString() });
+      }
+    }
+    const checks = ceAll
+      .filter(r => r.date_str === dateISO && r.completed_at_iso)
+      .map(r => ({
+        ts_iso: r.completed_at_iso,
+        check_type: String(r.check_type||''),
+        case_id: String(r.case_id||''),
+        duration_mins: Number(r.duration_mins||0),
+        state_at_log: String(r.state_at_log||'')
+      }));
+    return { date: dateISO, stints, checks };
+  });
+
+  return { ok:true, analyst_id: analystId, start: startISO, end: endISO, days };
+}
+
+/**
+ * Range stats (efficiency + per-type counts) using DailyMetrics where available,
+ * and falling back to CheckEvents/CheckTypes if needed.
+ */
+function getAnalystRangeStats(analystId, startISO, endISO) {
+  if (!analystId) throw new Error('Missing analystId');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(startISO) || !/^\d{4}-\d{2}-\d{2}$/.test(endISO)) {
+    throw new Error('Use YYYY-MM-DD for start and end');
+  }
+  const ss = master_();
+  const idNorm = normId_(analystId);
+
+  // Try DailyMetrics first
+  const dm = ss.getSheetByName(SHEETS.DAILY);
+  let totalHandling=0, totalStandard=0, totalAvailable=0, totalOutput=0;
+  if (dm && dm.getLastRow()>1) {
+    const v = dm.getDataRange().getValues();
+    const idx = indexMap_(v[0].map(String));
+    for (let r=1;r<v.length;r++){
+      const row=v[r];
+      const dateStr=String(row[idx['date']]||'').trim();
+      if (dateStr < startISO || dateStr > endISO) continue;
+      if (normId_(row[idx['analyst_id']]) !== idNorm) continue;
+      totalHandling += Number(row[idx['handling_mins']]||0);
+      totalStandard += Number(row[idx['standard_mins']]||0);
+      totalAvailable += Number(row[idx['available_mins']]||0);
+      totalOutput += Number(row[idx['output_total']]||0);
+    }
+  }
+
+  // If DM had nothing, compute from raw CE + CheckTypes averages
+  const ce = ss.getSheetByName(SHEETS.CHECK_EVENTS);
+  const types = readCheckTypes_(); // [{name, avg_minutes}]
+  const avgMap = {}; types.forEach(t => avgMap[String(t.name)] = Number(t.avg_minutes||0));
+
+  const byType = {};
+  if (ce && ce.getLastRow()>1) {
+    const v=ce.getDataRange().getValues();
+    const idx=indexMap_(v[0].map(String));
+    for (let r=1;r<v.length;r++){
+      const row=v[r];
+      const dateStr=String(row[idx['date']]||'').trim();
+      if (dateStr < startISO || dateStr > endISO) continue;
+      if (normId_(row[idx['analyst_id']]) !== idNorm) continue;
+
+      const ct = String(row[idx['check_type']]||'');
+      const mins = Number(row[idx['duration_mins']]||0);
+      if (mins>0) totalHandling += mins;
+      if (ct) {
+        totalOutput += 1;
+        byType[ct]=(byType[ct]||0)+1;
+        totalStandard += (avgMap[ct]||0);
+      }
+    }
+  } else {
+    // if we did have DM but still want byType counts, build them:
+    if (ce && ce.getLastRow()>1) {
+      const v=ce.getDataRange().getValues();
+      const idx=indexMap_(v[0].map(String));
+      for (let r=1;r<v.length;r++){
+        const row=v[r];
+        const dateStr=String(row[idx['date']]||'').trim();
+        if (dateStr < startISO || dateStr > endISO) continue;
+        if (normId_(row[idx['analyst_id']]) !== idNorm) continue;
+        const ct = String(row[idx['check_type']]||'');
+        if (ct) byType[ct]=(byType[ct]||0)+1;
+      }
+    }
+  }
+
+  const efficiency = totalStandard>0 ? Math.round((totalHandling/totalStandard)*100) : 0;
+  const utilisation = totalAvailable>0 ? Math.min(100, Math.round((totalHandling/totalAvailable)*100)) : 0;
+
+  // Sort counts by type desc
+  const typeCounts = Object.keys(byType).sort((a,b)=> (byType[b]-byType[a]) || a.localeCompare(b))
+    .map(k => ({ check_type:k, count:byType[k] }));
+
+  return {
+    ok:true,
+    analyst_id: analystId,
+    start: startISO,
+    end: endISO,
+    totals: {
+      handling_mins: totalHandling,
+      standard_mins: totalStandard,
+      available_mins: totalAvailable,
+      output_total: totalOutput,
+      efficiency_pct: efficiency,
+      utilisation_pct: utilisation
+    },
+    by_check_type: typeCounts
+  };
+}
