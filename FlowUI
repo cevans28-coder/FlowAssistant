@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <base target="_top">
+  <style>
+    :root{
+      --bg:#ffffff; --fg:#0b0f1a; --muted:#6b7280; --line:#e5e7eb;
+      --brand:#6c2bd9; --brand-2:#00c2a8; --chip:#f6f7fb;
+      --ok:#1bb36e; --warn:#f59e0b; --idle:#9aa3af; --danger:#e11d48;
+    }
+    *{ box-sizing:border-box; }
+    html, body{ margin:0; padding:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; }
+    header{
+      padding:10px 12px; position:sticky; top:0; z-index:5;
+      background:linear-gradient(180deg,#f7f7fb 0%, #ffffff 100%);
+      border-bottom:1px solid var(--line);
+      display:flex; align-items:center; justify-content:space-between;
+    }
+    .title{ display:flex; gap:8px; align-items:center; font-weight:800; color:#1f2937; }
+    .title .brandDot{ width:10px; height:10px; border-radius:999px; background:linear-gradient(135deg,var(--brand),var(--brand-2)); box-shadow:0 0 0 3px #ebe9f6 inset; }
+    .actions{ display:flex; gap:6px; align-items:center; }
+    .wrap{ padding:12px; display:grid; gap:12px; }
+    .row{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .card{
+      border:1px solid var(--line); border-radius:14px; padding:12px; background:#fff;
+      box-shadow:0 1px 0 rgba(17,24,39,0.02);
+    }
+    button, select, input{ font:inherit; padding:8px 12px; border:1px solid var(--line); border-radius:10px; background:#fafafa; }
+    button.primary{ background:var(--brand); color:#fff; border-color:var(--brand); }
+    button.primary:hover{ filter:brightness(1.05); }
+    .small{ font-size:12px; color:var(--muted); }
+    .loading{ opacity:0.6; pointer-events:none; }
+    .hidden{ display:none; }
+    .icon{
+      cursor:pointer; width:28px; height:28px; border:1px solid var(--line); border-radius:8px;
+      display:inline-grid; place-items:center; user-select:none; background:#fff;
+    }
+    .icon:hover{ background:#f3f4f6; }
+
+    .status{
+      display:inline-flex; align-items:center; gap:6px;
+      padding:6px 12px; border-radius:999px; background:var(--chip); border:1px solid var(--line);
+      font-weight:800; letter-spacing:.2px; font-size:18px; cursor:pointer; user-select:none;
+    }
+    .dot{ width:14px; height:14px; border-radius:999px; background:var(--idle); box-shadow:0 0 0 3px #fff; }
+    .dot.ok{ background:var(--ok); }
+    .dot.warn{ background:var(--warn); }
+    .dot.idle{ background:var(--idle); }
+    .dot.danger{ background:var(--danger); }
+    .stateText{ display:inline-flex; align-items:center; gap:6px; font-size:18px; }
+
+    .state-menu{
+      position:absolute; margin-top:6px; padding:6px; border:1px solid var(--line); background:#fff; border-radius:12px;
+      box-shadow:0 10px 25px rgba(0,0,0,0.08); display:none; z-index:10; min-width:220px;
+    }
+    .state-menu button{
+      width:100%; text-align:left; padding:8px 10px; background:#fff; border:1px solid transparent; border-radius:10px;
+    }
+    .state-menu button:hover{ background:#f7f7fb; border-color:#ececf7; }
+
+    .timer{
+      display:inline-block; font-variant-numeric:tabular-nums; font-weight:700; padding:2px 8px;
+      border:1px solid var(--line); border-radius:8px; background:#f9fafb;
+    }
+
+    /* ==== Exception modal (additive styles) ==== */
+    .modal-backdrop{
+      position:fixed; inset:0; background:rgba(0,0,0,0.25); display:none; z-index:30;
+    }
+    .modal{
+      position:fixed; inset:0; display:none; z-index:31;
+      align-items:center; justify-content:center; padding:20px;
+    }
+    .modal.show, .modal-backdrop.show{ display:flex; }
+    .modal-content{
+      width:100%; max-width:520px; background:#fff; border:1px solid var(--line);
+      border-radius:16px; padding:16px; box-shadow:0 20px 40px rgba(0,0,0,0.12);
+    }
+    .modal-content h3{ margin:0 0 8px 0; }
+    .modal-content label{ display:block; margin:8px 0 2px; font-weight:600; }
+    .modal-content input[type="date"],
+    .modal-content input[type="time"],
+    .modal-content select,
+    .modal-content textarea{
+      width:100%; background:#fafafa; border:1px solid var(--line); border-radius:10px; padding:8px 10px;
+    }
+    .modal-content textarea{ min-height:90px; resize:vertical; }
+    .modal-actions{ display:flex; gap:8px; justify-content:flex-end; margin-top:12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title"><span class="brandDot"></span> Flow Assistant V2.0 <span class="small" id="who"></span></div>
+    <div class="actions">
+      <!-- NEW: Report Exception button (analysts) -->
+      <button id="btnAddException" class="xbtn">➕ Report Exception</button>
+
+      <div class="icon" id="btnPop" title="Open in a standalone tab">⤢</div>
+      <div class="icon" id="btnMin" title="Minimise">—</div>
+      <div class="icon" id="btnLogOff" title="Log Off">⏻</div>
+    </div>
+  </header>
+
+  <div class="wrap" id="content">
+
+    <div class="card" id="card-register">
+      <div class="row" style="justify-content:space-between; width:100%;">
+        <div><button id="btnRegister">Log in/ Register</button></div>
+        <div class="small">Baseline hours:
+          <input id="baselineHours" type="number" min="1" step="0.5" style="width:92px" />
+          <button id="btnSaveBaseline" title="Save your daily contracted hours">Save</button>
+          <span id="baselineMsg" class="small"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" id="card-state" style="position:relative;">
+      <div class="row" style="margin-top:6px;">
+        <span>Current state:</span>
+        <span id="stateBadge" class="status" title="Click to change">
+          <span id="stateDot" class="dot idle"></span>
+          <span class="stateText" id="stateText">Idle</span>
+        </span>
+        <span class="small" id="stateTimer">00:00:00</span>
+      </div>
+      <div id="stateMenu" class="state-menu"></div>
+      <div id="stateMsg" class="small" style="margin-top:6px;"></div>
+    </div>
+
+    <div class="card">
+      <b>Working Location (once per day)</b><br/>
+      <select id="workLocation">
+        <option value="">— Select —</option>
+        <option value="Home">Home</option>
+        <option value="Office">Office</option>
+      </select>
+      <button id="btnSaveLocation">Save</button>
+      <div id="locMsg" class="small"></div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:6px;">
+        <b>Check Timer</b>
+        <span id="checkTimerDisplay" class="timer">00:00:00</span>
+        <button id="btnStartCheck" disabled>Start</button>
+        <button id="btnPauseCheck" disabled>Pause</button>
+        <button id="btnEndCheck" disabled>End</button>
+        <span class="small" id="timerMsg"></span>
+      </div>
+
+      <div class="row" style="gap:6px;">
+        <label for="checkType"><b>Complete Check</b></label>
+        <select id="checkType" title="Check Type"></select>
+        <input id="caseId" placeholder="Case ID (MP scorecard UID) *" />
+        <input id="duration" type="number" min="1" step="1" style="width:150px" placeholder="Minutes *" />
+        <button class="primary" id="btnComplete">Log</button>
+      </div>
+      <div class="small">* required fields</div>
+      <div id="checkMsg" class="small"></div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="gap:16px; align-items:flex-start;">
+        <div style="flex:1;">
+          <b>Calendar → MASTER</b>
+          <div class="small" style="margin:6px 0 8px;">Imports <b>Accepted</b> events with titles matching your <b>Config</b>.</div>
+          <div class="row"><button id="btnSyncToday">Sync My Calendar (Today)</button></div>
+          <div id="calMsg" class="small"></div>
+        </div>
+        <div style="flex:1;">
+          <b>Today (Quick Glance)</b>
+          <div id="sumBox" class="small">Loading…</div>
+          <div class="row" style="margin-top:6px;">
+            <button id="btnRefresh">Refresh</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ===== Exception Modal (analyst → TL notification) ===== -->
+  <div id="exceptionBackdrop" class="modal-backdrop"></div>
+  <div id="exceptionModal" class="modal" aria-hidden="true">
+    <div class="modal-content">
+      <h3>Report Exception</h3>
+      <div class="small" id="excInfo" style="margin-bottom:6px;"></div>
+
+      <label for="excDate">Date</label>
+      <input type="date" id="excDate" />
+
+      <div class="row" style="gap:8px">
+        <div style="flex:1">
+          <label for="excStart">Start time</label>
+          <input type="time" id="excStart" />
+        </div>
+        <div style="flex:1">
+          <label for="excEnd">End time</label>
+          <input type="time" id="excEnd" />
+        </div>
+      </div>
+
+      <label for="excCategory">Category</label>
+      <select id="excCategory">
+        <option value="">— Select —</option>
+        <option>System Outage</option>
+        <option>Appointment</option>
+        <option>Training</option>
+        <option>Connectivity</option>
+        <option>Other</option>
+      </select>
+
+      <label for="excReason">Details</label>
+      <textarea id="excReason" placeholder="Add any useful context for your Team Lead…"></textarea>
+
+      <div class="modal-actions">
+        <span class="small" id="excMsg" style="margin-right:auto"></span>
+        <button id="excCancel" class="xbtn">Cancel</button>
+        <button id="excSubmit" class="primary">Send</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Inject logic via Apps Script templating -->
+  <?!= include('FlowLogic'); ?>
+</body>
+</html>
