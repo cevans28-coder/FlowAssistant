@@ -1,147 +1,147 @@
 /******************************************************
- * 08_watchdog.gs — Inactivity rules & gentle nudges
+ * 08_watchdog.gs — Inactivity rules & gentle nudges (optimized)
  * Depends on:
  * - TZ, SHEETS (00_constants.gs)
- * - toISODate_, minutesBetween_, normId_ (01_utils.gs)
- * - master_(), getOrCreateMasterSheet_(), readRows_() (02_master_access.gs)
+ * - toISODate_, minutesBetween_, normId_, readRows_ (01_utils.gs)
+ * - master_(), getOrCreateMasterSheet_() (02_master_access.gs)
  * - getCurrentAnalystId_(), getSessionTokenFor_(), logLoginEvent_() (03_sessions.gs)
  * - upsertLive_() (04_state_engine.gs)
+ *
+ * Triggers (installed by ensureUserTriggers_ in 99_triggers.gs):
+ * - watchdog_heartbeat_10min() — every 10 minutes per user
+ *
+ * Behaviour:
+ * - If no heartbeat in >10m while Working/Admin → set Idle
+ * - If Idle and >60m without heartbeat → LoggedOut
+ * - If Break/Lunch and >60m without heartbeat → LoggedOut
+ * - All other states (Meeting/Training/Coaching/OOO/…) with >10m gap → LoggedOut
+ *
+ * Notes:
+ * - We write ONE StatusLogs row only when a transition is required.
+ * - We keep Live in sync and add an audit in LoginHistory.
  ******************************************************/
 
 /**
- * Watchdog — run every 10 minutes (per-user trigger).
- * Uses last_seen_iso (from heartbeat) to detect inactivity.
- * Writes one StatusLogs row only when a transition is needed.
- *
- * Rules:
- * - Working/Admin : >10m no heartbeat → Idle
- * - Idle : >60m no heartbeat → LoggedOut
- * - Break/Lunch : >60m no heartbeat → LoggedOut
- * - Others (Meeting/Training/Coaching/OOO/etc.): >10m no heartbeat → LoggedOut
+ * Watchdog — per-user trigger every ~10m.
+ * Uses last_seen_iso from PropertiesService(User) (set by heartbeat()).
+ * Writes to StatusLogs only if a state transition is needed.
  */
 function watchdog_heartbeat_10min() {
+  // 0) Read last heartbeat. If never set, we can’t infer inactivity → skip.
   const up = PropertiesService.getUserProperties();
   const last = up.getProperty('last_seen_iso');
-  if (!last) return; // no heartbeat ever → nothing to do
+  if (!last) return;
 
   const now = new Date();
   const lastDt = new Date(last);
-  const gapMins = minutesBetween_(lastDt, now);
-  if (gapMins <= 10) return; // still fresh
+  const gap = minutesBetween_(lastDt, now);
+  if (gap <= 10) return; // still fresh; nothing to do
 
   const id = getCurrentAnalystId_();
   const today = toISODate_(now);
   const ss = master_();
 
-  // Today’s last state record for this analyst
+  // 1) Read today’s last known state for this user
   const statusRows = readRows_(ss.getSheetByName(SHEETS.STATUS_LOGS))
     .filter(r => r.date_str === today && r.analyst_id_norm === id)
     .sort((a, b) => a.ts - b.ts);
 
   const lastRow = statusRows[statusRows.length - 1] || null;
   const lastState = lastRow ? String(lastRow.state || '') : 'Idle';
-  const lastSrc = lastRow ? String(lastRow.source || '').toLowerCase() : '';
+  const lastSrc = (lastRow ? String(lastRow.source || '') : '').toLowerCase();
 
-  // Avoid duplicate spam if the last was already written by watchdog,
-  // except we still allow the Idle→LoggedOut escalation after >60m.
+  // If the last write came from watchdog already, avoid spamming,
+  // but still allow the Idle→LoggedOut escalation (>60m)
   if (lastRow && lastSrc.indexOf('watchdog') !== -1) {
-    if (!(lastState === 'Idle' && gapMins > 60)) return;
+    if (!(lastState === 'Idle' && gap > 60)) return;
   }
 
-  const sh = getOrCreateMasterSheet_(SHEETS.STATUS_LOGS,
-    ['timestamp_iso','date','analyst_id','state','source','note']);
+  // Helper to append to StatusLogs + LIVE + audit in one shot
+  function writeTransition_(newState, note) {
+    const sh = getOrCreateMasterSheet_(SHEETS.STATUS_LOGS,
+      ['timestamp_iso','date','analyst_id','state','source','note']);
 
-  // --- Rules ---
+    sh.appendRow([now.toISOString(), today, id, newState, 'watchdog', note]);
 
-  // Break / Lunch: keep until >60m, then LoggedOut
-  if (['Break', 'Lunch'].includes(lastState)) {
-    if (gapMins <= 60) return;
-    sh.appendRow([now.toISOString(), today, id, 'LoggedOut', 'watchdog', 'Break/Lunch >60m no heartbeat']);
+    // Keep Live view consistent
     upsertLive_(id, {
       analyst_id: id,
-      online: 'NO',
+      online: (newState === 'LoggedOut') ? 'NO' : 'NO', // when watchdog mutates, mark NO
       last_seen_iso: now.toISOString(),
-      state: 'LoggedOut',
+      state: newState,
       since_iso: now.toISOString()
     });
-    logLoginEvent_('WatchdogLogout', 'Break/Lunch >60m no heartbeat', getSessionTokenFor_(id));
+
+    // Audit trail for session events
+    const token = getSessionTokenFor_(id);
+    logLoginEvent_(
+      newState === 'Idle' ? 'WatchdogIdle' : 'WatchdogLogout',
+      note,
+      token
+    );
+  }
+
+  /* =================== RULES =================== */
+
+  // Break/Lunch: allow up to 60m without heartbeat, then logout
+  if (lastState === 'Break' || lastState === 'Lunch') {
+    if (gap > 60) writeTransition_('LoggedOut', 'Break/Lunch >60m with no heartbeat');
     return;
   }
 
-  // Working / Admin: after >10m, soften to Idle
-  if (['Working', 'Admin'].includes(lastState)) {
-    sh.appendRow([now.toISOString(), today, id, 'Idle', 'watchdog', 'Auto-idle: no heartbeat >10m']);
-    upsertLive_(id, {
-      analyst_id: id,
-      online: 'NO',
-      last_seen_iso: now.toISOString(),
-      state: 'Idle',
-      since_iso: now.toISOString()
-    });
-    logLoginEvent_('WatchdogIdle', 'Auto-idle: no heartbeat >10m', getSessionTokenFor_(id));
+  // Working/Admin: after >10m without heartbeat → auto-Idle (softer)
+  if (lastState === 'Working' || lastState === 'Admin') {
+    writeTransition_('Idle', 'Auto-idle: no heartbeat >10m');
     return;
   }
 
-  // Idle: >60m → LoggedOut
+  // Idle: after >60m → LoggedOut
   if (lastState === 'Idle') {
-    if (gapMins > 60) {
-      sh.appendRow([now.toISOString(), today, id, 'LoggedOut', 'watchdog', 'Idle >60m with no heartbeat']);
-      upsertLive_(id, {
-        analyst_id: id,
-        online: 'NO',
-        last_seen_iso: now.toISOString(),
-        state: 'LoggedOut',
-        since_iso: now.toISOString()
-      });
-      logLoginEvent_('WatchdogLogout', 'Idle >60m with no heartbeat', getSessionTokenFor_(id));
-    }
+    if (gap > 60) writeTransition_('LoggedOut', 'Idle >60m with no heartbeat');
     return;
   }
 
-  // All other states (Meeting/Training/Coaching/OOO/…): >10m → LoggedOut
-  sh.appendRow([now.toISOString(), today, id, 'LoggedOut', 'watchdog', 'No heartbeat >10m']);
-  upsertLive_(id, {
-    analyst_id: id,
-    online: 'NO',
-    last_seen_iso: now.toISOString(),
-    state: 'LoggedOut',
-    since_iso: now.toISOString()
-  });
-  logLoginEvent_('WatchdogLogout', 'No heartbeat >10m', getSessionTokenFor_(id));
+  // Other states (Meeting/Training/Coaching/OOO/…):
+  // If no heartbeat for >10m, assume they are gone → LoggedOut
+  writeTransition_('LoggedOut', 'No heartbeat >10m');
 }
 
 /**
- * Optional nudge: if you are currently in a meeting (from CAL_PULL)
- * but your state is still Working, send yourself a reminder email.
- * Call this from your 10-minute cycle if you want gentle prompts.
+ * Optional nudge:
+ * If you are currently in a (accepted) calendar meeting but your state is Working,
+ * send yourself a polite email reminder to update your state.
+ * Safe to call from the 10-minute cycle; errors are swallowed.
  */
 function nudgeIfInMeetingButWorking_() {
-  const now = new Date();
-  const dateISO = toISODate_(now);
-  const id = getCurrentAnalystId_();
-  const ss = master_();
+  try {
+    const now = new Date();
+    const dateISO = toISODate_(now);
+    const id = getCurrentAnalystId_();
+    const ss = master_();
 
-  const calRows = readRows_(ss.getSheetByName(SHEETS.CAL_PULL))
-    .filter(r => r.date_str === dateISO && r.analyst_id_norm === id &&
-                 String(r.my_status || '').toLowerCase() === 'accepted');
+    const calRows = readRows_(ss.getSheetByName(SHEETS.CAL_PULL))
+      .filter(r => r.date_str === dateISO &&
+                   r.analyst_id_norm === id &&
+                   String(r.my_status || '').toLowerCase() === 'accepted');
 
-  const inMeeting = calRows.some(r => r.start && r.end && now >= r.start && now <= r.end);
-  if (!inMeeting) return;
+    const inMeeting = calRows.some(r => r.start && r.end && now >= r.start && now <= r.end);
+    if (!inMeeting) return;
 
-  const statusRows = readRows_(ss.getSheetByName(SHEETS.STATUS_LOGS))
-    .filter(r => r.date_str === dateISO && r.analyst_id_norm === id)
-    .sort((a, b) => a.ts - b.ts);
+    const statusRows = readRows_(ss.getSheetByName(SHEETS.STATUS_LOGS))
+      .filter(r => r.date_str === dateISO && r.analyst_id_norm === id)
+      .sort((a, b) => a.ts - b.ts);
 
-  const last = statusRows[statusRows.length - 1];
-  if (last && String(last.state) === 'Working') {
-    const email = Session.getActiveUser().getEmail() || Session.getEffectiveUser().getEmail();
-    if (!email) return;
-    try {
-      MailApp.sendEmail({
-        to: email,
-        subject: 'Flow Assistant: You’re in a meeting — update your state?',
-        htmlBody: 'You seem to be in a meeting now but your state is <b>Working</b>. Please switch to <b>Meeting</b>.'
-      });
-    } catch (e) { /* ignore mail errors */ }
-  }
+    const last = statusRows[statusRows.length - 1];
+    if (last && String(last.state) === 'Working') {
+      const email = Session.getActiveUser().getEmail() || Session.getEffectiveUser().getEmail();
+      if (!email) return;
+      try {
+        MailApp.sendEmail({
+          to: email,
+          subject: 'Flow Assistant — quick reminder',
+          htmlBody: 'We detected you appear to be in a meeting, but your state is <b>Working</b>. Want to switch to <b>Meeting</b>?'
+        });
+      } catch (e) { /* ignore email errors */ }
+    }
+  } catch (e) { /* swallow to keep trigger healthy */ }
 }
