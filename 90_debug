@@ -1,0 +1,124 @@
+
+function _debugTodayChecksForMe() {
+  const ss = master_();
+  const id = getCurrentAnalystId_();
+  const today = Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd');
+
+  // Count from CheckEvents
+  const ceRows = readRows_(ss.getSheetByName(SHEETS.CHECK_EVENTS))
+    .filter(r => r.date_str === today && r.analyst_id_norm === id);
+  const ceCount = ceRows.length;
+
+  // Inspect Live headers & current value
+  const live = ss.getSheetByName(SHEETS.LIVE);
+  const out = { today, me: id, ceCount, liveHeaderOk: false, liveTodayChecksValue: null, notes: [] };
+  if (!live || live.getLastRow() < 2) {
+    out.notes.push('LIVE sheet missing or empty.');
+    Logger.log(out); return out;
+  }
+  const vals = live.getDataRange().getValues();
+  const hdr = vals[0].map(String);
+  const L = indexMap_(hdr);
+  if (L['today_checks'] == null) {
+    out.notes.push('LIVE header "today_checks" not found. Header drift?');
+  } else {
+    out.liveHeaderOk = true;
+  }
+
+  let rowIndex = -1;
+  for (let r=1; r<vals.length; r++) {
+    if (normId_(vals[r][L['analyst_id']]) === id) { rowIndex = r; break; }
+  }
+  if (rowIndex === -1) {
+    out.notes.push('No LIVE row for you yet.');
+  } else if (out.liveHeaderOk) {
+    out.liveTodayChecksValue = vals[rowIndex][L['today_checks']];
+  }
+
+  Logger.log(out);
+  return out;
+}
+
+
+/**
+ * Canonical Live headers (must match exactly, in order).
+ */
+function __LIVE_HEADERS__() {
+  return [
+    'analyst_id','name','team','online','last_seen_iso','state','since_iso',
+    'mins_in_state','today_checks','baseline_hours','location_today','session_token',
+    'logged_in_mins','live_efficiency_pct','live_utilisation_pct','live_throughput_per_hr'
+  ];
+}
+
+/**
+ * Ensure Live has the canonical headers (exact text/order).
+ */
+function __ensureLiveHeadersExact__() {
+  const ss = master_();
+  const sh = ss.getSheetByName(SHEETS.LIVE) || ss.insertSheet(SHEETS.LIVE);
+  const HEAD = __LIVE_HEADERS__();
+
+  // Create/repair header row
+  const width = Math.max(HEAD.length, sh.getLastColumn() || 1);
+  const cur = sh.getRange(1, 1, 1, width).getValues()[0].map(String);
+  for (let i = 0; i < HEAD.length; i++) {
+    if ((cur[i] || '').trim() !== HEAD[i]) {
+      sh.getRange(1, i + 1).setValue(HEAD[i]);
+    }
+  }
+  sh.setFrozenRows(1);
+  return sh;
+}
+
+/**
+ * Keep only ONE Live row per analyst_id (normalised).
+ * We keep the row with the most-recent last_seen_iso, delete the rest.
+ * Then we run refreshLiveFor_ for each analyst to make the row consistent.
+ */
+function RUN_FIX_LIVE_DUPES() {
+  const ss = master_();
+  const sh = __ensureLiveHeadersExact__();
+  const v = sh.getDataRange().getValues();
+  if (v.length <= 1) return { ok: true, kept: 0, deleted: 0 };
+
+  const hdr = v[0].map(String);
+  const H = {};
+  hdr.forEach((h, i) => H[h] = i);
+
+  const byAnalyst = new Map(); // id_norm -> {rowIndex, lastSeen, values}
+  for (let r = 1; r < v.length; r++) {
+    const row = v[r];
+    const id = String(row[H['analyst_id']] || '').toLowerCase().trim();
+    if (!id) continue;
+
+    const lastSeenIso = String(row[H['last_seen_iso']] || '');
+    const lastSeen = lastSeenIso ? new Date(lastSeenIso) : new Date(0);
+
+    const cur = byAnalyst.get(id);
+    if (!cur || (lastSeen > cur.lastSeen)) {
+      byAnalyst.set(id, { rowIndex: r + 1, lastSeen, values: row });
+    }
+  }
+
+  // Build a set of rows to keep
+  const keep = new Set(Array.from(byAnalyst.values()).map(o => o.rowIndex));
+
+  // Rebuild the sheet with only header + kept rows
+  const keptRows = [];
+  for (let r = 1; r < v.length; r++) {
+    const rowIndex = r + 1;
+    if (keep.has(rowIndex)) keptRows.push(v[r]);
+  }
+
+  sh.clearContents();
+  sh.getRange(1, 1, 1, hdr.length).setValues([hdr]);
+  if (keptRows.length) sh.getRange(2, 1, keptRows.length, hdr.length).setValues(keptRows);
+
+  // Refresh each analyst we kept to ensure a consistent single-row snapshot
+  const ids = Array.from(byAnalyst.keys());
+  ids.forEach(id => { try { refreshLiveFor_(id); } catch (e) {} });
+
+  return { ok: true, kept: keptRows.length, deleted: (v.length - 1) - keptRows.length };
+}
+
