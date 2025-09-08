@@ -62,6 +62,7 @@ function stateAllowedForTL_(state) {
  * - Allowed states are hard-coded (TL_ALLOWED_STATES)
  * - Writes StatusLogs with source "manager:<email>"
  * - Updates Live (and clears token when setting LoggedOut)
+ * - Invalidates TL snapshot cache for "today" so changes are immediate in the console
  */
 function tlSetState(analystId, newState, note, managerEmail) {
   requireTL_();
@@ -92,6 +93,9 @@ function tlSetState(analystId, newState, note, managerEmail) {
   if (state === 'LoggedOut') patch.session_token = ''; // revoke sessions
   upsertLive_(id, patch);
 
+  // 3) Bust TL snapshot cache for today
+  invalidateTLSnapshotCacheFor_(today);
+
   return { ok: true, analyst_id: id, state, ts: now.toISOString() };
 }
 
@@ -100,15 +104,50 @@ function tlForceLogout(analystId, note, managerEmail) {
   return tlSetState(analystId, 'LoggedOut', note, managerEmail);
 }
 
+/* -------------------------------------------------------
+ * TL Console snapshot — public entry (cached ~45 seconds)
+ * ------------------------------------------------------- */
+
 /**
- * Returns TL snapshot for a given date, accepting multiple date formats.
- * Accepts: 'YYYY-MM-DD', 'DD/MM/YYYY', 'MM/DD/YYYY' (best-effort),
- * Date objects, and ISO timestamps. Normalises to 'YYYY-MM-DD' in TZ.
- * Output rows prefer LIVE KPIs; falls back to DailyMetrics if live is blank.
+ * Public: Returns TL snapshot for a given date (any of several formats).
+ * - Tries script cache first (per-day key)
+ * - Falls back to compute helper and caches the result
  */
 function getTLSnapshotData(dateISO) {
+  const day = normaliseToISODate_(dateISO, TZ);
+  const key = 'TLSNAP:' + day;
+  const cache = CacheService.getScriptCache();
+
+  const hit = cache.get(key);
+  if (hit) {
+    try { return JSON.parse(hit); } catch (e) { /* ignore corrupt cache */ }
+  }
+
+  const out = _computeTLSnapshotData_(day);
+  try { cache.put(key, JSON.stringify(out), 45); } catch(e) {}
+  return out;
+}
+
+/** Remove the cached snapshot for a given date (YYYY-MM-DD). */
+function invalidateTLSnapshotCacheFor_(dateISO) {
+  try {
+    const key = 'TLSNAP:' + normaliseToISODate_(dateISO, TZ);
+    CacheService.getScriptCache().remove(key);
+  } catch (e) {}
+}
+
+/**
+ * Private: heavy-lift snapshot builder.
+ * Accepts a normalised 'YYYY-MM-DD' and returns:
+ * { rows:[{...}], kpis:{...}, date:'YYYY-MM-DD' }
+ *
+ * - LIVE is the primary source for presence and *live* KPIs.
+ * - DAILY metrics are used as a fallback when live values are blank/zero.
+ * - Tolerant header lookups (no hard crashes if columns are missing).
+ */
+function _computeTLSnapshotData_(dateISO) {
   const ss = master_();
-  const dateStr = normaliseToISODate_(dateISO, TZ); // 'YYYY-MM-DD'
+  const dateStr = normaliseToISODate_(dateISO, TZ); // safe
 
   // ---- LIVE (current snapshot) ----
   const live = ss.getSheetByName(SHEETS.LIVE);
@@ -215,6 +254,10 @@ function getTLSnapshotData(dateISO) {
   return { rows: rowsOut, kpis, date: dateStr };
 }
 
+/* -------------------------------------------------------
+ * Helpers used by TL UI (timeline & date parsing)
+ * ------------------------------------------------------- */
+
 /**
  * Normalise many date inputs to 'YYYY-MM-DD' in the given timezone.
  * Handles:
@@ -274,7 +317,10 @@ function normaliseToISODate_(input, tz) {
   return Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
 }
 
-// --- TL: Day timeline for one analyst (read-only)
+/**
+ * TL: Day timeline for one analyst (read-only).
+ * Caps to the selected day and (if today) to the current time.
+ */
 function getAnalystDayTimeline(analystId, dateISO) {
   if (!analystId) throw new Error('Missing analystId');
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateISO)) throw new Error('Use YYYY-MM-DD');
