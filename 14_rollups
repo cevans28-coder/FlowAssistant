@@ -1,0 +1,293 @@
+/******************************************************
+ * 14_rollups.gs — Daily per-type rollups for TL Console
+ *
+ * Creates & maintains a DailyTypeSummary sheet:
+ * date | analyst_id | check_type | count | handling_mins | standard_mins
+ *
+ * Depends on:
+ * - master_(), getOrCreateMasterSheet_(), readRows_, indexMap_, normId_, toISODate_ (your utils)
+ * - SHEETS (00_constants.gs) — optional; falls back if missing
+ * - readCheckTypes_() → [{name, name_norm?, avg_minutes}]
+ *
+ * Safe to backfill from existing CheckEvents at any time.
+ ******************************************************/
+
+/* ============================ CONFIG ============================ */
+
+// Prefer constants.SHEETS.DAILY_TYPE_SUMMARY, else fallback.
+const _DTS_SHEET_NAME = (typeof SHEETS !== 'undefined' && SHEETS && SHEETS.DAILY_TYPE_SUMMARY)
+  ? SHEETS.DAILY_TYPE_SUMMARY
+  : 'DailyTypeSummary';
+
+// Canonical headers for the rollup
+const _DTS_HEADERS = ['date', 'analyst_id', 'check_type', 'count', 'handling_mins', 'standard_mins'];
+
+// Small helpers
+function _r_safeNum(n){ n = Number(n); return Number.isFinite(n) ? n : 0; }
+function _r_clamp0(n){ n = _r_safeNum(n); return n < 0 ? 0 : n; }
+function _r_normKey(s){
+  return String(s || '')
+    .replace(/\u00A0/g, ' ') // NBSP → space
+    .replace(/\s+/g, ' ') // collapse spaces
+    .trim()
+    .toLowerCase();
+}
+// Accept numeric minutes or "hh:mm[:ss]" strings
+function _r_toMinutes(val){
+  if (val == null || val === '') return 0;
+  if (typeof val === 'number' && isFinite(val)) return val;
+  const s = String(val).trim();
+  if (!s.includes(':')) return _r_safeNum(s);
+  const parts = s.split(':').map(Number);
+  const h = _r_safeNum(parts[0]), m = _r_safeNum(parts[1]), sec = _r_safeNum(parts[2] || 0);
+  return (h * 60) + m + Math.round(sec / 60);
+}
+
+/* ================== SHEET ENSURE / CLEAR HELPERS ================== */
+
+/** Ensure the DailyTypeSummary sheet exists and headers are aligned. */
+function getOrCreateDailyTypeSummary_(){
+  const ss = master_();
+  let sh = ss.getSheetByName(_DTS_SHEET_NAME);
+  if (!sh) sh = ss.insertSheet(_DTS_SHEET_NAME);
+
+  // align header row (no destructive re-creation)
+  const width = Math.max(_DTS_HEADERS.length, sh.getLastColumn() || 1);
+  const first = sh.getRange(1, 1, 1, width).getValues()[0] || [];
+  _DTS_HEADERS.forEach((h, i) => {
+    if (String(first[i] || '').trim() !== h) sh.getRange(1, i + 1).setValue(h);
+  });
+  sh.setFrozenRows(1);
+  return sh;
+}
+
+/** Remove any existing rows for (dateISO, analystId) prior to upsert. */
+function _dts_deleteExistingFor_(dateISO, analystId){
+  const sh = getOrCreateDailyTypeSummary_();
+  if (sh.getLastRow() < 2) return;
+
+  const values = sh.getDataRange().getValues();
+  const idx = indexMap_(values[0].map(String));
+  const rowsToDelete = [];
+  for (let r = 1; r < values.length; r++){
+    if (String(values[r][idx['date']] || '') === dateISO &&
+        normId_(values[r][idx['analyst_id']] || '') === normId_(analystId)) {
+      rowsToDelete.push(r + 1);
+    }
+  }
+  // delete bottom-up
+  for (let i = rowsToDelete.length - 1; i >= 0; i--){
+    sh.deleteRow(rowsToDelete[i]);
+  }
+}
+
+/* ================== CORE BUILDERS (ONE DAY) ================== */
+
+/**
+ * Build per-type rollup rows for an analyst on a date from CheckEvents.
+ * Returns an array of objects matching _DTS_HEADERS keys.
+ */
+function buildDailyTypeSummaryRows_(analystId, dateISO){
+  const ss = master_();
+  const ce = ss.getSheetByName(SHEETS && SHEETS.CHECK_EVENTS ? SHEETS.CHECK_EVENTS : 'CheckEvents');
+  if (!ce || ce.getLastRow() < 2) return [];
+
+  const ceRows = readRows_(ce)
+    .filter(r => r.date_str === dateISO && normId_(r.analyst_id) === normId_(analystId));
+
+  if (!ceRows.length) return [];
+
+  // Average minutes map (normalised by key)
+  const avgMap = {};
+  (readCheckTypes_() || []).forEach(t => {
+    const key = _r_normKey(t.name_norm || t.name);
+    avgMap[key] = _r_toMinutes(t.avg_minutes);
+  });
+
+  // Aggregate per type
+  const bucket = {};
+  ceRows.forEach(r => {
+    const key = _r_normKey(r.check_type);
+    if (!key) return;
+    if (!bucket[key]) bucket[key] = { count: 0, handling: 0, check_type: r.check_type };
+    bucket[key].count += 1;
+    bucket[key].handling += _r_clamp0(r.duration_mins);
+  });
+
+  // Convert to row objects
+  const out = [];
+  Object.keys(bucket).forEach(k => {
+    const b = bucket[k];
+    const std = _r_clamp0(b.count) * _r_clamp0(avgMap[k]);
+    out.push({
+      date: dateISO,
+      analyst_id: analystId,
+      check_type: b.check_type, // keep human label
+      count: _r_clamp0(b.count),
+      handling_mins: Math.round(_r_clamp0(b.handling)),
+      standard_mins: Math.round(std)
+    });
+  });
+  return out;
+}
+
+/** Upsert daily rollup rows for one analyst+date (clear then append). */
+function upsertDailyTypeSummaryFor_(analystId, dateISO){
+  const rows = buildDailyTypeSummaryRows_(analystId, dateISO);
+  const sh = getOrCreateDailyTypeSummary_();
+
+  // Clear existing set & append fresh rows
+  _dts_deleteExistingFor_(dateISO, analystId);
+  if (!rows.length) return { ok: true, wrote: 0 };
+
+  // Map objects → row arrays
+  const hdr = _DTS_HEADERS.slice();
+  const out = rows.map(obj => hdr.map(h => obj[h]));
+
+  // --- SAFE APPEND (no insertRowsAfter; avoids "starting row too small") ---
+  const startRow = Math.max(2, sh.getLastRow() + 1);
+  sh.getRange(startRow, 1, out.length, hdr.length).setValues(out);
+
+  return { ok: true, wrote: out.length };
+}
+
+/* ================== BACKFILLERS / RANGE BUILDERS ================== */
+
+/**
+ * Rebuild rollups for ALL analysts who have CheckEvents on dateISO.
+ */
+function rebuildDailyTypeSummaryForDateForAll_(dateISO){
+  const ss = master_();
+  const ce = ss.getSheetByName(SHEETS && SHEETS.CHECK_EVENTS ? SHEETS.CHECK_EVENTS : 'CheckEvents');
+  if (!ce || ce.getLastRow() < 2) return { ok: true, wrote: 0, analysts: 0 };
+
+  const rows = readRows_(ce).filter(r => r.date_str === dateISO);
+  const ids = Array.from(new Set(rows.map(r => normId_(r.analyst_id)).filter(Boolean)));
+
+  let total = 0;
+  ids.forEach(id => { total += upsertDailyTypeSummaryFor_(id, dateISO).wrote || 0; });
+  return { ok: true, date: dateISO, analysts: ids.length, wrote: total };
+}
+
+/**
+ * Backfill a date range inclusive, scanning CheckEvents to find analysts per day.
+ * Use small ranges (e.g., last 30/60 days) for speed.
+ */
+function backfillDailyTypeSummaryRange_(startISO, endISO){
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(startISO || '')) ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(String(endISO || ''))) {
+    throw new Error('Use YYYY-MM-DD for start/end');
+  }
+  const s = new Date(startISO + 'T00:00:00');
+  const e = new Date(endISO + 'T00:00:00');
+  if (e < s) throw new Error('End before start');
+
+  let wrote = 0, days = 0, analysts = 0;
+  for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
+    const iso = Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    const res = rebuildDailyTypeSummaryForDateForAll_(iso);
+    wrote += res.wrote || 0;
+    analysts += res.analysts || 0;
+    days += 1;
+  }
+  return { ok: true, days, analysts, wrote };
+}
+
+/** Convenience: backfill last N days (inclusive, today counted as day 1). */
+function backfillDailyTypeSummaryLastNDays_(n){
+  n = Math.max(1, Math.floor(n||7));
+  const tz = Session.getScriptTimeZone();
+  const today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+  const start = Utilities.formatDate(new Date(Date.now() - (n-1)*24*3600*1000), tz, 'yyyy-MM-dd');
+  return backfillDailyTypeSummaryRange_(start, today);
+}
+
+/* ===================== FETCH / API FOR UI ===================== */
+
+/**
+ * Aggregate an analyst’s per-type summary for a date range from DailyTypeSummary.
+ * Returns: { rows:[{check_type,count,handling_mins,standard_mins}], totals:{...} }
+ */
+function getTypeBreakdownForAnalystRange_(analystId, startISO, endISO){
+  const sh = getOrCreateDailyTypeSummary_();
+  if (sh.getLastRow() < 2) return { rows: [], totals: { count:0, handling_mins:0, standard_mins:0 } };
+
+  const vals = sh.getDataRange().getValues();
+  const idx = indexMap_(vals[0].map(String));
+  const want = normId_(analystId);
+
+  // inclusive date filter
+  const s = new Date(startISO + 'T00:00:00').getTime();
+  const e = new Date(endISO + 'T23:59:59').getTime();
+
+  const bucket = {};
+  for (let r = 1; r < vals.length; r++){
+    const dateStr = String(vals[r][idx['date']] || '');
+    const ts = Date.parse(dateStr);
+    if (!(ts >= s && ts <= e)) continue;
+    if (normId_(vals[r][idx['analyst_id']] || '') !== want) continue;
+
+    const type = String(vals[r][idx['check_type']] || '') || 'Unknown';
+    const cnt = _r_clamp0(vals[r][idx['count']]);
+    const h = _r_clamp0(vals[r][idx['handling_mins']]);
+    const std = _r_clamp0(vals[r][idx['standard_mins']]);
+
+    if (!bucket[type]) bucket[type] = { check_type:type, count:0, handling_mins:0, standard_mins:0 };
+    bucket[type].count += cnt;
+    bucket[type].handling_mins += h;
+    bucket[type].standard_mins += std;
+  }
+
+  const rows = Object.keys(bucket).sort().map(k => ({
+    check_type: k,
+    count: bucket[k].count,
+    handling_mins: Math.round(bucket[k].handling_mins),
+    standard_mins: Math.round(bucket[k].standard_mins)
+  }));
+
+  const totals = rows.reduce((acc, r)=>({
+    count: acc.count + r.count,
+    handling_mins: acc.handling_mins + r.handling_mins,
+    standard_mins: acc.standard_mins + r.standard_mins
+  }), {count:0, handling_mins:0, standard_mins:0});
+
+  return { rows, totals };
+}
+
+/* ===================== TL Console PROXIES ===================== */
+/* Call these from code.gs (or expose them directly if you prefer). */
+
+/** TL: per-analyst, per-range breakdown (day/week/month/custom). */
+function tlGetAnalystTypeBreakdown(analystId, startISO, endISO){
+  return getTypeBreakdownForAnalystRange_(analystId, startISO, endISO);
+}
+
+/** TL (optional): rebuild today for all (handy after bulk edits). */
+function tlRebuildDailyTypeSummaryToday(){
+  const tz = Session.getScriptTimeZone();
+  const today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+  return rebuildDailyTypeSummaryForDateForAll_(today);
+}
+
+/** TL (optional): backfill last N days quick wrapper. */
+function tlBackfillTypeSummaryLastNDays(n){
+  return backfillDailyTypeSummaryLastNDays_(n || 7);
+}
+
+/* ===================== QUICK TEST / SMOKE ===================== */
+
+/** Build for me, today (smoke). */
+function DTS_Smoke_Me_Today(){
+  const me = getCurrentAnalystId_();
+  const today = toISODate_(new Date());
+  const res = upsertDailyTypeSummaryFor_(me, today);
+  Logger.log(JSON.stringify(res));
+  return res;
+}
+
+/** Backfill the last 7 days (inclusive). */
+function DTS_Backfill_Last7(){
+  const res = backfillDailyTypeSummaryLastNDays_(7);
+  Logger.log(JSON.stringify(res));
+  return res;
+}
