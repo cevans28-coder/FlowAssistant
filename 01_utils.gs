@@ -1,78 +1,94 @@
 /******************************************************
- * Flow Assistant — Utilities
- * Shared helper functions used across the project
+ * 01_utils.gs — Core utilities (refined)
+ * - Safe, tiny helpers used across the project
+ * - Careful not to change existing behaviour/signatures
  ******************************************************/
 
-/** Return a mapping of { headerName: columnIndex } */
+/**
+ * Build a { headerName: columnIndex } map.
+ * Assumes headers are unique in the row.
+ */
 function indexMap_(headers) {
-  const m = {};
-  (headers || []).forEach((h, i) => m[String(h).trim()] = i);
+  const m = Object.create(null);
+  (headers || []).forEach((h, i) => { m[String(h).trim()] = i; });
   return m;
 }
 
-/** Normalise analyst IDs and emails (lowercase + trim) */
+/** Normalise analyst IDs/emails consistently (lowercase+trim). */
 function normId_(s) {
   return String(s || '').toLowerCase().trim();
 }
 
-/** Format a Date to ISO string (yyyy-MM-dd) in project TZ */
+/** Format Date → 'YYYY-MM-DD' in project TZ (no time). */
 function toISODate_(d) {
   return Utilities.formatDate(d, TZ, 'yyyy-MM-dd');
 }
 
-/** Minutes between two Date objects */
+/**
+ * Whole minutes between two Date objects (non-negative, rounded).
+ * Preserves your original rounding behaviour (Math.round).
+ */
 function minutesBetween_(a, b) {
   return Math.max(0, Math.round((b - a) / 60000));
 }
 
-/** Rounding helpers */
+/** Small rounding helpers used for KPI displays. */
 function round0(n) { return Math.round(Number(n) || 0); }
 function round2(n) { return Math.round((Number(n) || 0) * 100) / 100; }
+/** Keep 4 decimals on a *fraction* then convert to percent elsewhere if needed. */
 function roundPct(n) { return Math.round((Number(n) || 0) * 10000) / 10000; }
 
 /**
- * Convert a sheet into array of row objects with:
- * - normalised fields
- * - parsed timestamps
- * - date_str field
+ * Read a sheet into an array of row objects with conveniences:
+ * - Keys by header names
+ * - `analyst_id_norm` (normalised)
+ * - `ts` (Date from 'timestamp_iso' or 'completed_at_iso' if present)
+ * - `start` / `end` (Date from 'start_iso' / 'end_iso' if present)
+ * - `date_str` ('YYYY-MM-DD' from ts or 'date' column)
+ *
+ * NOTE: Skips fully empty rows to save downstream work.
  */
 function readRows_(sh) {
   if (!sh) return [];
   const vals = sh.getDataRange().getValues();
   if (!vals || vals.length <= 1) return [];
+
   const hdr = vals[0].map(h => String(h).trim());
   const out = [];
-
   for (let r = 1; r < vals.length; r++) {
     const row = vals[r];
-    if (!row || !row.some(c => c !== '')) continue;
+    // Fast skip for fully empty rows
+    if (!row || row.every(c => c === '' || c === null)) continue;
 
     const o = {};
-    hdr.forEach((h, i) => o[h] = row[i]);
+    // Map by header name
+    for (let i = 0; i < hdr.length; i++) o[hdr[i]] = row[i];
 
-    // Normalise analyst_id
+    // Normalised analyst id helper
     o.analyst_id_norm = normId_(o['analyst_id']);
 
-    // Parse timestamps
+    // Parse canonical timestamp fields
     const tsIso = o['timestamp_iso'] || o['completed_at_iso'] || null;
     if (tsIso) {
       const ts = new Date(tsIso);
       if (!isNaN(ts)) o.ts = ts;
     }
-    if (o['start_iso']) o.start = new Date(o['start_iso']);
-    if (o['end_iso']) o.end = new Date(o['end_iso']);
+    // Optional range timestamps
+    if (o['start_iso']) { const s = new Date(o['start_iso']); if (!isNaN(s)) o.start = s; }
+    if (o['end_iso']) { const e = new Date(o['end_iso']); if (!isNaN(e)) o.end = e; }
 
-    // Normalised date_str
+    // Derive normalised 'YYYY-MM-DD' date string
     let dateStr = '';
     if (o.ts instanceof Date && !isNaN(o.ts)) {
       dateStr = Utilities.formatDate(o.ts, TZ, 'yyyy-MM-dd');
     } else {
       const raw = o['date'];
-      if (typeof raw === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw.trim())) {
-        dateStr = raw.trim();
-      } else if (raw instanceof Date && !isNaN(raw)) {
+      if (raw instanceof Date && !isNaN(raw)) {
         dateStr = Utilities.formatDate(raw, TZ, 'yyyy-MM-dd');
+      } else if (typeof raw === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw.trim())) {
+        dateStr = raw.trim();
       } else {
+        // last resort: keep whatever was there (for debugging)
         dateStr = String(raw || '').trim();
       }
     }
@@ -84,206 +100,168 @@ function readRows_(sh) {
 }
 
 /**
- * Delete rows matching predicate
- * @param {Sheet} sh - target sheet
- * @param {function(Array):boolean} pred - returns true to delete row
+ * Delete rows matching predicate and keep header row intact.
+ * Rewrites the sheet in one go to reduce API calls.
+ * @param {Sheet} sh
+ * @param {(row:Array)=>boolean} pred - return true to delete that data row
  */
 function deleteRowsBy_(sh, pred) {
   if (!sh) return;
   const v = sh.getDataRange().getValues();
   if (!v || v.length <= 1) return;
+
   const hdr = v[0];
   const keep = v.slice(1).filter(r => !pred(r));
-
   sh.clearContents();
   sh.getRange(1, 1, 1, hdr.length).setValues([hdr]);
   if (keep.length) sh.getRange(2, 1, keep.length, keep[0].length).setValues(keep);
 }
 
-// Sum minutes today where state != 'LoggedOut', capping ongoing stint at NOW
-function computeLoggedInMinutesToday_(analystId) {
-  const ss = master_();
-  const now = new Date();
-  const today = toISODate_(now); // e.g., '2025-09-03'
+/* ===========================================================
+ * Shared date helpers (centralised here for reuse)
+ * =========================================================== */
 
-  // Normalised rows for TODAY only, sorted
-  const rows = readRows_(ss.getSheetByName(SHEETS.STATUS_LOGS))
-    .filter(r => r.date_str === today && r.analyst_id_norm === normId_(analystId))
-    .sort((a,b) => a.ts - b.ts);
+/**
+ * Normalise many date inputs to 'YYYY-MM-DD' in TZ.
+ * Accepts:
+ * - 'YYYY-MM-DD' (returns as-is)
+ * - 'DD/MM/YYYY' and 'MM/DD/YYYY' (best-effort, UK-first)
+ * - Date objects
+ * - ISO timestamps 'YYYY-MM-DDTHH:mm:ssZ'
+ * - Other parsable strings (fallback via new Date())
+ *
+ * This mirrors the tolerant version you used in 09_tl_api.
+ * Keep it here so other files can call the same function.
+ */
+function normaliseToISODate_(input, tz) {
+  const _tz = tz || TZ;
+  if (!input) return Utilities.formatDate(new Date(), _tz, 'yyyy-MM-dd');
 
-  if (!rows.length) return 0;
-
-  // Build stints: each log starts a stint; end is next log, or end-of-day — but capped at NOW
-  const endOfDay = Utilities.parseDate(today + ' 23:59:59', TZ, 'yyyy-MM-dd HH:mm:ss');
-  let total = 0;
-
-  for (let i = 0; i < rows.length; i++) {
-    const cur = rows[i];
-    const next = rows[i+1];
-
-    const start = cur.ts;
-    if (!start) continue;
-
-    // Natural end (next log or end-of-day)
-    let end = next && next.ts ? next.ts : endOfDay;
-
-    // Cap at NOW for live counting
-    if (end > now) end = now;
-
-    // Skip invalid/zero stints
-    if (!end || end <= start) continue;
-
-    // Exclude LoggedOut stints
-    const state = String(cur.state || '');
-    if (state === 'LoggedOut') continue;
-
-    total += minutesBetween_(start, end); // your existing helper
+  // Date object
+  if (input instanceof Date && !isNaN(input)) {
+    return Utilities.formatDate(input, _tz, 'yyyy-MM-dd');
   }
 
-  // Guard against negative/NaN
-  return Math.max(0, Math.round(total));
+  const s = String(input).trim();
+
+  // Already ISO YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+  // ISO timestamp → Date → ISO
+  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) {
+    const d = new Date(s);
+    if (!isNaN(d)) return Utilities.formatDate(d, _tz, 'yyyy-MM-dd');
+  }
+
+  // DD/MM/YYYY or MM/DD/YYYY
+  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) {
+    let d = parseInt(m[1], 10);
+    let mo = parseInt(m[2], 10);
+    const y = parseInt(m[3], 10);
+
+    // Disambiguate generously (prefer UK style when ambiguous)
+    if (d > 12) {
+      // DD/MM — fine
+    } else if (mo > 12) {
+      // Impossible month -> must be DD/MM (swap)
+      const tmp = d; d = mo; mo = tmp;
+    } else {
+      // Ambiguous like 04/05/2025 → assume DD/MM (UK style)
+      // (no swap: we already treat first as day)
+    }
+
+    const jsDate = new Date(y, mo - 1, d, 12, 0, 0); // Noon avoids DST edges
+    return Utilities.formatDate(jsDate, _tz, 'yyyy-MM-dd');
+  }
+
+  // Fallback to Date()
+  const tryDate = new Date(s);
+  if (!isNaN(tryDate)) {
+    return Utilities.formatDate(tryDate, _tz, 'yyyy-MM-dd');
+  }
+
+  // Last resort: today
+  return Utilities.formatDate(new Date(), _tz, 'yyyy-MM-dd');
 }
-// Compute TODAY handling_mins, output_total, and standard_mins so far
-function computeLiveProductionToday_(analystId) {
-  const ss = master_();
-  const dateISO = toISODate_(new Date());
 
-  // Baseline & meetings
-  const baselineHours = Number(getBaselineHoursForAnalyst_(analystId) || 8.5);
-  const baselineMins = Math.max(0, Math.round(baselineHours * 60));
-  const meetingMins = Math.max(0, getAcceptedMeetingMinutes_(analystId, dateISO));
-  const availableMins = Math.max(0, baselineMins - meetingMins);
+/**
+ * Compute start/end Date objects (in TZ) for a given ISO date.
+ * Optionally caps end to "now" when that date is today.
+ * @param {string} dateISO 'YYYY-MM-DD'
+ * @param {boolean} capToNow default true
+ * @returns {{start: Date, end: Date}}
+ */
+function computeDayBounds_(dateISO, capToNow) {
+  const d = String(dateISO || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) throw new Error('Use YYYY-MM-DD');
 
-  // Status stints today (cap open stint at NOW)
-  const sl = readRows_(ss.getSheetByName(SHEETS.STATUS_LOGS))
-            .filter(r => r.date_str === dateISO && r.analyst_id_norm === normId_(analystId))
-            .sort((a,b)=> a.ts - b.ts);
-  const stints = stitchStintsCappedToNow_(sl, dateISO);
+  const start = Utilities.parseDate(d + ' 00:00:00', TZ, 'yyyy-MM-dd HH:mm:ss');
+  let end = Utilities.parseDate(d + ' 23:59:59', TZ, 'yyyy-MM-dd HH:mm:ss');
 
-  // Logged-in = Working + Idle
-  const LOGGED_IN_STATES = new Set(['Working','Idle']);
-  let loggedInMins = 0;
-  for (const s of stints) {
-    if (LOGGED_IN_STATES.has(String(s.state))) {
-      loggedInMins += minutesBetween_(s.start, s.end);
+  if (capToNow !== false) {
+    const todayISO = Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd');
+    if (d === todayISO) {
+      const now = new Date();
+      if (now < end) end = now;
     }
   }
-  loggedInMins = Math.max(0, Math.round(loggedInMins));
 
-  // Checks today
-  const ce = readRows_(ss.getSheetByName(SHEETS.CHECK_EVENTS))
-            .filter(r => r.date_str === dateISO && r.analyst_id_norm === normId_(analystId));
-  const handlingMins = Math.max(0, Math.round(ce.reduce((a,r)=> a + (Number(r.duration_mins)||0), 0)));
-  const outputTotal = ce.length;
-
-  // Standard mins (CheckTypes × counts)
-  const types = readCheckTypes_(); const avg = {};
-  types.forEach(t => avg[t.name] = Number(t.avg_minutes || 0));
-  const countByType = {};
-  ce.forEach(r => { const t = String(r.check_type || ''); if (t) countByType[t] = (countByType[t]||0) + 1; });
-  const standardMins = Object.keys(countByType).reduce((sum,t)=> sum + (countByType[t] * (avg[t]||0)), 0);
-
-  // KPIs (no caps; guard denominators)
-  const live_eff = standardMins > 0 ? Math.round((handlingMins / standardMins) * 100) : 0;
-  const live_util = availableMins > 0 ? Math.round((handlingMins / availableMins) * 100) : 0;
-  const live_tph = availableMins > 0 ? Number((outputTotal / (availableMins/60)).toFixed(2)) : 0;
-
-  return {
-    dateISO,
-    logged_in_mins: loggedInMins,
-    live_efficiency_pct: live_eff,
-    live_utilisation_pct: live_util, // can be >100 by design now
-    live_throughput_per_hr: live_tph
-  };
+  if (end <= start) end = new Date(start.getTime() + 60 * 1000); // guard: 1 min window
+  return { start, end };
 }
 
-function updateLiveKPIsFor_(analystId) {
-  const id = normId_(analystId || getCurrentAnalystId_());
+function adminRecountTodayChecksAll() {
   const ss = master_();
+  const live = ss.getSheetByName(SHEETS.LIVE);
+  const today = toISODate_(new Date());
+  if (!live || live.getLastRow() < 2) return { ok:false, updated:0 };
 
-  // Pull inputs (today only)
-  const today = Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd');
+  const vals = live.getDataRange().getValues();
+  const hdr = vals[0].map(String);
+  const L = indexMap_(hdr);
 
-  // Baseline hours
-  const baselineHrs = Number(getBaselineHoursForAnalyst_(id) || 8.5);
-  const baselineMins = Math.max(0, Math.round(baselineHrs * 60));
+  let n=0;
+  for (let r=1; r<vals.length; r++) {
+    const id = String(vals[r][L['analyst_id']]||'').trim();
+    if (!id) continue;
+    const count = readRows_(ss.getSheetByName(SHEETS.CHECK_EVENTS))
+      .filter(x => x.date_str===today && x.analyst_id_norm===normId_(id)).length;
+    if (L['today_checks'] != null) {
+      live.getRange(r+1, L['today_checks']+1).setValue(count);
+      n++;
+    }
+  }
+  return { ok:true, updated:n };
+}
 
-  // Meetings (accepted)
-  const meetMins = getAcceptedMeetingMinutes_(id, today) || 0;
 
-  // Available mins (cannot be negative)
-  const availableMins = Math.max(0, baselineMins - meetMins);
-
-  // Handling + output + standard mins from CheckEvents
-  let handlingMins = 0, outputTotal = 0, standardMins = 0;
-  const avg = {};
-  (readCheckTypes_() || []).forEach(t => avg[String(t.name)] = Number(t.avg_minutes || 0));
-
-  const ce = ss.getSheetByName(SHEETS.CHECK_EVENTS);
-  if (ce && ce.getLastRow() > 1) {
-    const vals = ce.getDataRange().getValues();
-    const idx = indexMap_(vals[0].map(String));
-    for (let r=1;r<vals.length;r++){
-      const row = vals[r];
-      if (String(row[idx['date']]||'') !== today) continue;
-      if (normId_(row[idx['analyst_id']]) !== id) continue;
-      const mins = Number(row[idx['duration_mins']] || 0);
-      const ct = String(row[idx['check_type']] || '');
-      if (mins > 0) handlingMins += mins;
-      if (ct) {
-        outputTotal += 1;
-        standardMins += (avg[ct] || 0);
+/** Safe wrapper for Flow Assistant “Quick Glance”
+ * Returns today's exceptions for the signed-in analyst.
+ * If Exceptions module isn’t present, returns [] (no errors).
+ */
+function getMyExceptionsForDate(dateISO) {
+  try {
+    var me = (Session.getActiveUser().getEmail() || '').toLowerCase();
+    if (!dateISO) {
+      dateISO = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    }
+    // If your Exceptions module exposes a suitable method:
+    if (typeof Exceptions !== 'undefined') {
+      // Try a couple of common shapes
+      if (typeof Exceptions.listMineForDate === 'function') {
+        return Exceptions.listMineForDate(dateISO); // expected: array of items
+      }
+      if (typeof Exceptions.listForAnalystDate === 'function') {
+        return Exceptions.listForAnalystDate(me, dateISO); // alternate signature
       }
     }
+  } catch (e) {
+    // Swallow and fall through to empty set
   }
+  return []; // no exceptions or module not present
+}
 
-  // Logged-in mins (Working/Admin/Meeting/Training/Coaching/Break/Lunch/Idle — i.e., everything except LoggedOut/OOO)
-  const sl = readRows_(ss.getSheetByName(SHEETS.STATUS_LOGS))
-    .filter(r => r.date_str === today && r.analyst_id_norm === id)
-    .sort((a,b)=> a.ts - b.ts);
-
-  const { start, end } = (typeof computeDayBounds_ === 'function') 
-    ? computeDayBounds_(today) 
-    : { 
-        start: Utilities.parseDate(today+' 00:00:00', TZ, 'yyyy-MM-dd HH:mm:ss'), 
-        end: new Date() 
-      };
-
-  let loggedInMins = 0;
-  for (let i=0;i<sl.length;i++){
-    const cur = sl[i], next = sl[i+1];
-    if (!cur.ts) continue;
-    const s = new Date(Math.max(cur.ts.getTime(), start.getTime()));
-    const e = next && next.ts ? new Date(Math.min(next.ts.getTime(), end.getTime())) : new Date(end);
-    if (e <= s) continue;
-    const st = String(cur.state||'');
-    if (st && !/^(LoggedOut|OOO)$/i.test(st)) {
-      loggedInMins += Math.round((e - s)/60000);
-    }
-  }
-
-  // KPIs with guards (cap utilisation at 200% to avoid wild test loops; you can choose 100 if you prefer)
-  const eff = (standardMins > 0) ? Math.round((handlingMins / standardMins) * 100) : 0;
-  const utlRaw = (availableMins > 0) ? (handlingMins / availableMins) * 100 : 0;
-  const utl = Math.min(200, Math.round(utlRaw)); // or 100 to hard-cap
-  const tput = (availableMins > 0) ? Number((outputTotal / (availableMins / 60)).toFixed(2)) : 0;
-
-  // Write to Live (numeric only, no blanks)
-  const live = ss.getSheetByName(SHEETS.LIVE);
-  if (!live || live.getLastRow() < 2) return;
-  const lVals = live.getDataRange().getValues();
-  const L = indexMap_(lVals[0].map(String));
-  let rowIndex = -1;
-  for (let r=1;r<lVals.length;r++){
-    if (normId_(lVals[r][L['analyst_id']]) === id) { rowIndex = r+1; break; }
-  }
-  if (rowIndex === -1) return;
-
-  const safeSet = (colName, value) => {
-    if (L[colName] != null) live.getRange(rowIndex, L[colName]+1).setValue(Number(value)||0);
-  };
-  safeSet('logged_in_mins', loggedInMins);
-  safeSet('live_efficiency_pct', eff);
-  safeSet('live_utilisation_pct', utl);
-  safeSet('live_throughput_per_hr', tput);
+function Exceptions_listMineForDate(dateISO) {
+  return getMyExceptionsForDate(dateISO);
 }
