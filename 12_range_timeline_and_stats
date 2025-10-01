@@ -1,0 +1,262 @@
+/******************************************************
+ * 12_range_timeline_and_stats.gs
+ * Range timeline (stints + checks) and aggregated stats helpers
+ *
+ * Public:
+ * - getAnalystRangeTimeline(analystId, startISO, endISO)
+ * - getAnalystRangeStats(analystId, startISO, endISO)
+ *
+ * Depends on existing project helpers:
+ * - TZ, SHEETS
+ * - master_(), readRows_(), indexMap_()
+ * - normId_(), toISODate_(), computeDayBounds_()
+ * - readCheckTypes_()
+ ******************************************************/
+
+/* -------------------- tiny local utilities -------------------- */
+
+/** Enumerate YYYY-MM-DD dates inclusive in the given TZ. */
+function listISOdays_(startISO, endISO, tz) {
+  const out = [];
+  const s = Utilities.parseDate(startISO + ' 00:00:00', tz, 'yyyy-MM-dd HH:mm:ss');
+  const e = Utilities.parseDate(endISO + ' 00:00:00', tz, 'yyyy-MM-dd HH:mm:ss');
+  if (!(s instanceof Date) || isNaN(s) || !(e instanceof Date) || isNaN(e) || e < s) return out;
+  const d = new Date(s);
+  while (d <= e) {
+    out.push(Utilities.formatDate(d, tz, 'yyyy-MM-dd'));
+    d.setDate(d.getDate() + 1);
+  }
+  return out;
+}
+
+/** Clamp an ISO timestamp to the chosen day using the shared computeDayBounds_. */
+function clampToDay_(iso, dateISO, tz) {
+  const bounds = computeDayBounds_(dateISO, true /* capToNow when today */);
+  const d = new Date(iso);
+  const clamped = new Date(Math.min(Math.max(d.getTime(), bounds.start.getTime()), bounds.end.getTime()));
+  return clamped;
+}
+
+/* -------------------- Range timeline API -------------------- */
+/**
+ * Build a per-day timeline (stints from StatusLogs + Checks from CheckEvents),
+ * capping each stint to the day window and (if today) to "now".
+ *
+ * Returns:
+ * {
+ * ok:true,
+ * analyst_id, start, end,
+ * days:[{
+ * date: 'YYYY-MM-DD',
+ * stints:[{ state, start_iso, end_iso }],
+ * checks:[{ ts_iso, check_type, case_id, duration_mins, state_at_log }]
+ * }, ...]
+ * }
+ */
+function getAnalystRangeTimeline(analystId, startISO, endISO) {
+  if (!analystId) throw new Error('Missing analystId');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(startISO) || !/^\d{4}-\d{2}-\d{2}$/.test(endISO)) {
+    throw new Error('Use YYYY-MM-DD for start and end');
+  }
+
+  const ss = master_();
+  const idNorm = normId_(analystId);
+  const todayISO = toISODate_(new Date());
+
+  // Pull rows once and filter by id+range
+  const slAll = readRows_(ss.getSheetByName(SHEETS.STATUS_LOGS))
+    .filter(r => r.analyst_id_norm === idNorm && r.date_str >= startISO && r.date_str <= endISO)
+    .sort((a, b) => a.ts - b.ts);
+
+  const ceAll = readRows_(ss.getSheetByName(SHEETS.CHECK_EVENTS))
+    .filter(r => r.analyst_id_norm === idNorm && r.date_str >= startISO && r.date_str <= endISO);
+
+  const days = listISOdays_(startISO, endISO, TZ).map(dateISO => {
+    // ---- stints from StatusLogs (capped) ----
+    const rows = slAll.filter(r => r.date_str === dateISO);
+    const stints = [];
+    if (rows.length) {
+      for (let i = 0; i < rows.length; i++) {
+        const cur = rows[i], next = rows[i + 1];
+        if (!cur.ts) continue;
+
+        const s = clampToDay_(cur.ts.toISOString(), dateISO, TZ);
+        let e;
+        if (next && next.ts) {
+          e = clampToDay_(next.ts.toISOString(), dateISO, TZ);
+        } else {
+          // end of day, capped to now if today
+          const endOfDay = Utilities.parseDate(dateISO + ' 23:59:59', TZ, 'yyyy-MM-dd HH:mm:ss');
+          const now = new Date();
+          e = (dateISO === todayISO) ? new Date(Math.min(endOfDay.getTime(), now.getTime())) : endOfDay;
+        }
+
+        if (e > s) {
+          stints.push({
+            state: String(cur.state || 'Idle'),
+            start_iso: s.toISOString(),
+            end_iso: e.toISOString()
+          });
+        }
+      }
+    }
+
+    // ---- checks from CheckEvents ----
+    const checks = ceAll
+      .filter(r => r.date_str === dateISO && r.completed_at_iso)
+      .map(r => ({
+        ts_iso: r.completed_at_iso,
+        check_type: String(r.check_type || ''),
+        case_id: String(r.case_id || ''),
+        duration_mins: Number(r.duration_mins || 0),
+        state_at_log: String(r.state_at_log || '')
+      }));
+
+    return { date: dateISO, stints, checks };
+  });
+
+  return { ok: true, analyst_id: analystId, start: startISO, end: endISO, days };
+}
+
+/* -------------------- Range stats API -------------------- */
+/**
+ * Aggregate efficiency/utilisation/output over a date range.
+ *
+ * Strategy:
+ * - Use DailyMetrics when available for authoritative totals.
+ * - If no DailyMetrics rows are found in the range, fall back to CheckEvents.
+ * - ALWAYS build per-type counts from CheckEvents (but avoid double-counting totals).
+ */
+function getAnalystRangeStats(analystInput, startISO, endISO){
+  const want = _resolveAnalystId_(analystInput);
+  const ss = master_();
+  const tz = Session.getScriptTimeZone();
+
+  // Baseline
+  const baseHrs = (function(){
+    const sh = ss.getSheetByName((SHEETS && SHEETS.ANALYSTS) ? SHEETS.ANALYSTS : 'Analysts');
+    if (!sh || sh.getLastRow()<2) return 7.5;
+    const v = sh.getDataRange().getValues();
+    const idx = _indexMapLoose_(v[0]);
+    const cAid = idx['analyst_id'] ?? idx['email'] ?? idx['id'];
+    const cBase = idx['baseline_hours'] ?? idx['contracted_hours'] ?? idx['hours_per_day'];
+    for (let r=1;r<v.length;r++){
+      if (_normId_(v[r][cAid]) === want){
+        const h = _n_(v[r][cBase] ?? 7.5); return (h>0? h : 7.5);
+      }
+    }
+    return 7.5;
+  })();
+  const baseMins = Math.round(baseHrs*60);
+
+  // Sources
+  const { meetingMap, oooMinsMap } = _qa_readMeetingsAndOOO_(ss, startISO, endISO, tz);
+  const exMap = (function(){
+    const sh = ss.getSheetByName((SHEETS && SHEETS.EXCEPTIONS) ? SHEETS.EXCEPTIONS : 'Exceptions');
+    const map = Object.create(null); if (!sh || sh.getLastRow()<2) return map;
+    const v = sh.getDataRange().getValues();
+    const idx = _indexMapLoose_(v[0]);
+    const cAid = idx['analyst_id'] ?? idx['from_analyst_id'] ?? idx['email'];
+    const cDate= idx['date'] ?? idx['date_iso'] ?? null;
+    const cStart= idx['start_iso'] ?? idx['start_ts'] ?? idx['start'] ?? null;
+    const cEnd = idx['end_iso'] ?? idx['end_ts'] ?? idx['end'] ?? null;
+    const cMin = idx['minutes'] ?? null;
+    for (let r=1;r<v.length;r++){
+      if (_normId_(v[r][cAid]) !== want) continue;
+      let d = cDate!=null ? _asISO_(v[r][cDate]) : '';
+      if (!d && cStart!=null && v[r][cStart]){
+        const dt = v[r][cStart] instanceof Date ? v[r][cStart] : new Date(v[r][cStart]);
+        if (dt instanceof Date && !isNaN(dt)) d = Utilities.formatDate(dt, tz, 'yyyy-MM-dd');
+      }
+      if (!_betweenISO_(d, startISO, endISO)) continue;
+      let mins = 0;
+      if (cMin!=null) mins = _n_(v[r][cMin]);
+      else if (cStart!=null && cEnd!=null && v[r][cStart] && v[r][cEnd]){
+        const a = v[r][cStart] instanceof Date ? v[r][cStart] : new Date(v[r][cStart]);
+        const b = v[r][cEnd] instanceof Date ? v[r][cEnd] : new Date(v[r][cEnd]);
+        mins = (b>a) ? Math.round((b-a)/60000) : 0;
+      }
+      const key = want + '|' + d;
+      map[key] = (map[key]||0) + Math.max(0, mins);
+    }
+    return map;
+  })();
+
+  // Expected, Actual, Meetings (display), OOO (raw)
+  const days = (function(){
+    const out=[]; const s=Utilities.parseDate(startISO+' 00:00:00', tz, 'yyyy-MM-dd HH:mm:ss');
+    const e=Utilities.parseDate(endISO+' 00:00:00', tz, 'yyyy-MM-dd HH:mm:ss');
+    for(let d=new Date(s); d<=e; d.setDate(d.getDate()+1)) out.push(Utilities.formatDate(d, tz, 'yyyy-MM-dd'));
+    return out;
+  })();
+
+  let expected=0, actual=0, meetingsDisp=0, oooTotal=0, exceptions=0;
+  for (const d of days){
+    const key = want + '|' + d;
+    const meet = _n_(meetingMap[key] || 0);
+    const oooM = _n_(oooMinsMap[key] || 0);
+    const ex = _n_(exMap[key] || 0);
+
+    let exp=0;
+    if (oooM >= baseMins - 1) exp = 0; // full-day OOO
+    else exp = Math.max(0, baseMins - meet - ex - oooM);
+
+    const act = _qa_sumActualWorkingMins_(ss, want, d, d); // per-day actual
+
+    const scheduledNonWork = Math.min(baseMins, meet + oooM); // cap at baseline for display
+
+    expected += exp;
+    actual += act;
+    meetingsDisp += scheduledNonWork;
+    oooTotal += oooM;
+    exceptions += ex;
+  }
+
+  const adherence = expected > 0 ? Math.round((actual/expected)*100) : 0;
+
+  // Keep your existing fields; add ooo_mins if your client accepts it
+  return {
+    analyst_id: want,
+    startISO, endISO,
+    meeting_mins: Math.round(meetingsDisp),
+    exception_mins: Math.round(exceptions),
+    ooo_mins: Math.round(oooTotal),
+    expected_available_mins: Math.round(expected),
+    actual_working_mins: Math.round(actual),
+    adherence_pct: adherence
+  };
+}
+
+function _resolveAnalystId_(input){
+  const raw = String(input||'').trim();
+  let candidate = raw;
+  if (!candidate){
+    try { candidate = (Session.getActiveUser().getEmail() || Session.getEffectiveUser().getEmail() || '').trim(); } catch(e){}
+  }
+  if (!candidate) return '';
+  const want = _normId_(candidate);
+
+  try {
+    const ss = master_();
+    const sh = ss.getSheetByName((SHEETS && SHEETS.ANALYSTS) ? SHEETS.ANALYSTS : 'Analysts');
+    if (sh && sh.getLastRow()>1){
+      const v = sh.getDataRange().getValues();
+      const idx = _indexMapLoose_(v[0]);
+      const cId = idx['analyst_id'] ?? idx['email'] ?? idx['id'];
+      const cUser = idx['username'] ?? idx['short_id'] ?? null;
+      const map = new Map();
+      for (let r=1;r<v.length;r++){
+        const aid = _normId_(v[r][cId]||''); if (!aid) continue;
+        map.set(aid, aid);
+        if (cUser!=null && v[r][cUser]) map.set(_normId_(v[r][cUser]), aid);
+      }
+      if (map.has(want)) return map.get(want);
+      if (want.includes('@')){
+        const local = _normId_(want.split('@')[0]);
+        if (map.has(local)) return map.get(local);
+      }
+    }
+  } catch(e){}
+
+  return want;
+}
