@@ -1,0 +1,117 @@
+/** ================== CalendarPull_v2 UPSERT ==================
+ * Expected headers (first row) in CalendarPull_v2:
+ * date_iso | analyst_id | start_iso | end_iso | title | my_status | guest_count | event_id | updated_at_iso
+ * - event_id: the Google Calendar event id (or iCal UID); MUST be stable across refreshes
+ * - my_status: accepted/yes/tentative/declined
+ * ============================================================ */
+
+function _cp_master_(){ return (typeof master_==='function') ? master_() : SpreadsheetApp.getActiveSpreadsheet(); }
+function _cp_sheet_(){
+  const ss = _cp_master_();
+  let sh = ss.getSheetByName('CalendarPull_v2');
+  if (!sh) {
+    sh = ss.insertSheet('CalendarPull_v2');
+    sh.getRange(1,1,1,9).setValues([[
+      'date_iso','analyst_id','start_iso','end_iso','title','my_status','guest_count','event_id','updated_at_iso'
+    ]]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+function _cp_idx_(arr){ const m={}; (arr||[]).forEach((h,i)=> m[String(h||'').toLowerCase()] = i); return m; }
+function _cp_iso(d){
+  if (d instanceof Date && !isNaN(d)) return Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd'T'HH:mm:ss");
+  const t = new Date(d); if (t instanceof Date && !isNaN(t)) return Utilities.formatDate(t, Session.getScriptTimeZone(), "yyyy-MM-dd'T'HH:mm:ss");
+  return String(d||'');
+}
+function _cp_asDateISO(x){
+  if (x instanceof Date && !isNaN(x)) return Utilities.formatDate(x, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  const d = new Date(x); if (d instanceof Date && !isNaN(d)) return Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  const s = String(x||''); return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : s.slice(0,10);
+}
+
+/**
+ * Upsert an array of rows into CalendarPull_v2.
+ * rows: [{ date_iso, analyst_id, start_iso, end_iso, title, my_status, guest_count, event_id }]
+ * The upsert key = (date_iso|analyst_id|event_id)
+ */
+function upsertCalendarPull(rows){
+  const sh = _cp_sheet_();
+  const last = sh.getLastRow();
+  const nowIso = new Date().toISOString();
+
+  // Read existing and build an index by composite key
+  const existing = (last>=2) ? sh.getRange(1,1,last,9).getValues() :
+    [['date_iso','analyst_id','start_iso','end_iso','title','my_status','guest_count','event_id','updated_at_iso']];
+  const idx = _cp_idx_(existing[0]);
+
+  const KEY = (r)=> {
+    const d = _cp_asDateISO(r[idx['date_iso']]);
+    const a = String(r[idx['analyst_id']]||'').toLowerCase().trim();
+    const e = String(r[idx['event_id']]||'').trim();
+    return d + '|' + a + '|' + e;
+  };
+
+  const map = new Map();
+  for (let i=1;i<existing.length;i++){
+    const k = KEY(existing[i]);
+    if (k) map.set(k, i); // value = row index in existing array (0-based for existing[])
+  }
+
+  const toWrite = []; // rows for new inserts
+  const updates = []; // [rowIndexInExistingArray, rowValues] for in-place updates
+
+  (rows||[]).forEach(r=>{
+    const date_iso = _cp_asDateISO(r.date_iso || r.start_iso);
+    const analyst = String(r.analyst_id || r.email || '').toLowerCase().trim();
+    const event_id = String(r.event_id || r.id || r.uid || '').trim(); // MUST be stable!
+
+    if (!date_iso || !analyst || !event_id) return; // skip malformed
+
+    const rowVals = [
+      date_iso,
+      analyst,
+      _cp_iso(r.start_iso || r.start),
+      _cp_iso(r.end_iso || r.end),
+      String(r.title || r.summary || '').trim(),
+      String(r.my_status || r.response || 'accepted').toLowerCase(),
+      Number(r.guest_count || r.attendees || 0),
+      event_id,
+      nowIso
+    ];
+
+    const k = date_iso + '|' + analyst + '|' + event_id;
+    if (map.has(k)){
+      const at = map.get(k); // index in existing[]
+      updates.push([at, rowVals]);
+    } else {
+      toWrite.push(rowVals);
+    }
+  });
+
+  // Apply updates in-place (batched by contiguous ranges)
+  if (updates.length){
+    updates.sort((a,b)=> a[0]-b[0]);
+    let start = updates[0][0], buf = [];
+    const flush = ()=>{
+      if (!buf.length) return;
+      // +1 for header row offset, +1 because sheet rows are 1-based
+      sh.getRange(start+1+1, 1, buf.length, 9).setValues(buf);
+      buf = [];
+    };
+    for (let i=0;i<updates.length;i++){
+      const [rowIndex, vals] = updates[i];
+      if (i===0){ start = rowIndex; buf.push(vals); continue; }
+      if (rowIndex === start + buf.length){ buf.push(vals); }
+      else { flush(); start = rowIndex; buf = [vals]; }
+    }
+    flush();
+  }
+
+  // Append new
+  if (toWrite.length){
+    sh.getRange(sh.getLastRow()+1, 1, toWrite.length, 9).setValues(toWrite);
+  }
+
+  return { ok:true, updated: updates.length, inserted: toWrite.length, total_after: sh.getLastRow()-1 };
+}
