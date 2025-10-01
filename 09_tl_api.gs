@@ -381,3 +381,20 @@ function computeDayBounds_(dateISO) {
 
   return { start, end };
 }
+
+/* -------------------------------------------------------
+ * UI wrappers expected by tl.app.html
+ * ------------------------------------------------------- */
+
+/** Tiny init payload for the TL console (today’s date, TZ-normalised). */
+function getTLInit() {
+  requireTL_();
+  return { today: Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd') };
+}
+
+/** UI-facing snapshot: strict wrapper over getTLSnapshotData() */
+function getTLSnapshot(dateISO) {
+  requireTL_();
+  const out = getTLSnapshotData(dateISO);
+  return out; // { rows, kpis, date }
+}
