@@ -1,23 +1,25 @@
 /******************************************************
- * 14_rollups.gs — Daily per-type rollups for TL Console
+ * 14_rollups.gs — Daily per-type rollups for TL Console (V2-ready)
  *
  * Creates & maintains a DailyTypeSummary sheet:
  * date | analyst_id | check_type | count | handling_mins | standard_mins
  *
  * Depends on:
- * - master_(), getOrCreateMasterSheet_(), readRows_, indexMap_, normId_, toISODate_ (your utils)
- * - SHEETS (00_constants.gs) — optional; falls back if missing
+ * - master_(), getOrCreateMasterSheet_(), readRows_, indexMap_, normId_, toISODate_
+ * - SHEETS (00_constants.gs)
  * - readCheckTypes_() → [{name, name_norm?, avg_minutes}]
- *
- * Safe to backfill from existing CheckEvents at any time.
  ******************************************************/
 
 /* ============================ CONFIG ============================ */
 
-// Prefer constants.SHEETS.DAILY_TYPE_SUMMARY, else fallback.
-const _DTS_SHEET_NAME = (typeof SHEETS !== 'undefined' && SHEETS && SHEETS.DAILY_TYPE_SUMMARY)
-  ? SHEETS.DAILY_TYPE_SUMMARY
-  : 'DailyTypeSummary';
+// Prefer SHEETS.DAILY_TYPE_SUMMARY (e.g., 'DailyTypeSummary_v2'); fall back to legacy once.
+const _DTS_SHEET_NAME =
+  (typeof SHEETS !== 'undefined' && SHEETS && SHEETS.DAILY_TYPE_SUMMARY) ?
+    SHEETS.DAILY_TYPE_SUMMARY : 'DailyTypeSummary_v2';
+
+const _CHECK_EVENTS_SHEET_NAME =
+  (typeof SHEETS !== 'undefined' && SHEETS && SHEETS.CHECK_EVENTS) ?
+    SHEETS.CHECK_EVENTS : 'CheckEvents_v2';
 
 // Canonical headers for the rollup
 const _DTS_HEADERS = ['date', 'analyst_id', 'check_type', 'count', 'handling_mins', 'standard_mins'];
@@ -58,6 +60,7 @@ function getOrCreateDailyTypeSummary_(){
     if (String(first[i] || '').trim() !== h) sh.getRange(1, i + 1).setValue(h);
   });
   sh.setFrozenRows(1);
+  try { sh.autoResizeColumns(1, _DTS_HEADERS.length); } catch(e){}
   return sh;
 }
 
@@ -89,11 +92,13 @@ function _dts_deleteExistingFor_(dateISO, analystId){
  */
 function buildDailyTypeSummaryRows_(analystId, dateISO){
   const ss = master_();
-  const ce = ss.getSheetByName(SHEETS && SHEETS.CHECK_EVENTS ? SHEETS.CHECK_EVENTS : 'CheckEvents');
+  const ce = ss.getSheetByName(_CHECK_EVENTS_SHEET_NAME)
+            || ss.getSheetByName('CheckEvents') // final fallback
+            || ss.getSheetByName('CheckEvents_v2'); // defensive
   if (!ce || ce.getLastRow() < 2) return [];
 
   const ceRows = readRows_(ce)
-    .filter(r => r.date_str === dateISO && normId_(r.analyst_id) === normId_(analystId));
+    .filter(r => r.date_str === dateISO && r.analyst_id_norm === normId_(analystId));
 
   if (!ceRows.length) return [];
 
@@ -109,7 +114,7 @@ function buildDailyTypeSummaryRows_(analystId, dateISO){
   ceRows.forEach(r => {
     const key = _r_normKey(r.check_type);
     if (!key) return;
-    if (!bucket[key]) bucket[key] = { count: 0, handling: 0, check_type: r.check_type };
+    if (!bucket[key]) bucket[key] = { count: 0, handling: 0, label: String(r.check_type || '') };
     bucket[key].count += 1;
     bucket[key].handling += _r_clamp0(r.duration_mins);
   });
@@ -122,7 +127,7 @@ function buildDailyTypeSummaryRows_(analystId, dateISO){
     out.push({
       date: dateISO,
       analyst_id: analystId,
-      check_type: b.check_type, // keep human label
+      check_type: b.label || k, // keep human label when available
       count: _r_clamp0(b.count),
       handling_mins: Math.round(_r_clamp0(b.handling)),
       standard_mins: Math.round(std)
@@ -144,7 +149,7 @@ function upsertDailyTypeSummaryFor_(analystId, dateISO){
   const hdr = _DTS_HEADERS.slice();
   const out = rows.map(obj => hdr.map(h => obj[h]));
 
-  // --- SAFE APPEND (no insertRowsAfter; avoids "starting row too small") ---
+  // Single write
   const startRow = Math.max(2, sh.getLastRow() + 1);
   sh.getRange(startRow, 1, out.length, hdr.length).setValues(out);
 
@@ -158,11 +163,13 @@ function upsertDailyTypeSummaryFor_(analystId, dateISO){
  */
 function rebuildDailyTypeSummaryForDateForAll_(dateISO){
   const ss = master_();
-  const ce = ss.getSheetByName(SHEETS && SHEETS.CHECK_EVENTS ? SHEETS.CHECK_EVENTS : 'CheckEvents');
+  const ce = ss.getSheetByName(_CHECK_EVENTS_SHEET_NAME)
+            || ss.getSheetByName('CheckEvents')
+            || ss.getSheetByName('CheckEvents_v2');
   if (!ce || ce.getLastRow() < 2) return { ok: true, wrote: 0, analysts: 0 };
 
   const rows = readRows_(ce).filter(r => r.date_str === dateISO);
-  const ids = Array.from(new Set(rows.map(r => normId_(r.analyst_id)).filter(Boolean)));
+  const ids = Array.from(new Set(rows.map(r => r.analyst_id_norm).filter(Boolean)));
 
   let total = 0;
   ids.forEach(id => { total += upsertDailyTypeSummaryFor_(id, dateISO).wrote || 0; });
@@ -171,7 +178,7 @@ function rebuildDailyTypeSummaryForDateForAll_(dateISO){
 
 /**
  * Backfill a date range inclusive, scanning CheckEvents to find analysts per day.
- * Use small ranges (e.g., last 30/60 days) for speed.
+ * Use modest ranges (e.g., 30–60 days) for speed.
  */
 function backfillDailyTypeSummaryRange_(startISO, endISO){
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(startISO || '')) ||
@@ -240,7 +247,7 @@ function getTypeBreakdownForAnalystRange_(analystId, startISO, endISO){
 
   const rows = Object.keys(bucket).sort().map(k => ({
     check_type: k,
-    count: bucket[k].count,
+    count: Math.round(bucket[k].count),
     handling_mins: Math.round(bucket[k].handling_mins),
     standard_mins: Math.round(bucket[k].standard_mins)
   }));
@@ -255,7 +262,6 @@ function getTypeBreakdownForAnalystRange_(analystId, startISO, endISO){
 }
 
 /* ===================== TL Console PROXIES ===================== */
-/* Call these from code.gs (or expose them directly if you prefer). */
 
 /** TL: per-analyst, per-range breakdown (day/week/month/custom). */
 function tlGetAnalystTypeBreakdown(analystId, startISO, endISO){
