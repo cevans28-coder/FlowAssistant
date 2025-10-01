@@ -1,0 +1,215 @@
+<!-- insights.widget.html -->
+<style>
+  .iw-wrap { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+  .iw-card { border:1px solid #e5e7eb; border-radius:12px; background:#fff; padding:10px; }
+  .iw-title { font-weight:800; margin-bottom:6px; }
+  .iw-day { margin-bottom:10px; }
+  .iw-row { display:flex; gap:6px; align-items:center; }
+  .iw-bar {
+    position:relative; height:10px; border-radius:6px; background:#eef2ff; overflow:hidden; flex:1;
+  }
+  .iw-chunk {
+    position:absolute; top:0; bottom:0; border-radius:6px;
+  }
+  .iw-chunk.Working { background:#d1fae5; }
+  .iw-chunk.Admin, .iw-chunk.Administration { background:#fde68a; }
+  .iw-chunk.Meeting { background:#e0e7ff; }
+  .iw-chunk.Break { background:#fee2e2; }
+  .iw-chunk.Lunch { background:#fcd34d; }
+  .iw-chunk.Idle { background:#f3f4f6; }
+  .iw-chunk.Exception { background:#fbcfe8; }
+  .iw-chip { display:inline-block; padding:2px 6px; border:1px solid #e5e7eb; border-radius:999px; font-size:12px; background:#fafafa; }
+  .iw-cal-item { font-size:12px; color:#374151; }
+  .iw-tip {
+    position:absolute; z-index:50; background:#111827; color:#fff; padding:6px 8px; border-radius:8px; font-size:12px; display:none; white-space:nowrap;
+  }
+</style>
+
+<script>
+(function(){
+  // ===== Compact list helpers (kept for backward compatibility in other views) =====
+  function fmtHM(mins){
+    const m = Math.max(0, Math.round(mins||0));
+    const h = Math.floor(m/60), r = m%60;
+    return `${h}h ${r}m`;
+  }
+  function dayRange(startISO,endISO){
+    // Expects YYYY-MM-DD; used elsewhere. Left untouched.
+    const out=[]; const d=new Date(startISO+'T00:00:00'); const end=new Date(endISO+'T00:00:00');
+    while(d<=end){ out.push(d.toISOString().slice(0,10)); d.setDate(d.getDate()+1); }
+    return out;
+  }
+
+  // Tooltip
+  let tipEl=null;
+  function ensureTip(){ if(!tipEl){ tipEl=document.createElement('div'); tipEl.className='iw-tip'; document.body.appendChild(tipEl);} return tipEl; }
+  function showTip(html,x,y){ const el=ensureTip(); el.innerHTML=html; el.style.display='block'; el.style.left=(x+10)+'px'; el.style.top=(y+10)+'px'; }
+  function hideTip(){ if(tipEl) tipEl.style.display='none'; }
+
+  function renderBarsForDay(day,segs,checks,exceptions){
+    // Used by the older “chip bar” view; retained for compatibility.
+    const startM=8*60,endM=18*60,span=endM-startM;
+    const bar=document.createElement('div'); bar.className='iw-bar';
+
+    [...segs,...(exceptions||[])].forEach(s=>{
+      const st=new Date(s.start_iso); const en=new Date(s.end_iso);
+      const sm=st.getHours()*60+st.getMinutes(); const em=en.getHours()*60+en.getMinutes();
+      const leftPct=((Math.max(sm,startM)-startM)/span)*100;
+      const rightPct=((Math.min(em,endM)-startM)/span)*100;
+      const widthPct=Math.max(0,rightPct-leftPct);
+      if(widthPct<=0) return;
+
+      const chunk=document.createElement('div');
+      chunk.className='iw-chunk '+(s.state||s.category||'Idle');
+      chunk.style.left=leftPct+'%'; chunk.style.width=widthPct+'%';
+
+      // Tooltip detail
+      const myChecks=checks.filter(c=>{const t=new Date(c.ts_iso); return t>=st&&t<=en;});
+      const detail=myChecks.length
+        ? `<div style="margin-top:4px">${myChecks.slice(0,3).map(c=>`<div>• ${c.case_id||'—'} (${c.minutes||0}m)</div>`).join('')}${myChecks.length>3?`<div>+${myChecks.length-3} more</div>`:''}</div>`
+        : `<div style="margin-top:4px;color:#9ca3af">No checks in segment</div>`;
+
+      chunk.addEventListener('mousemove',e=>{ showTip(`<b>${s.state||s.category}</b> — ${fmtHM(s.minutes)}<br/>${detail}`,e.pageX,e.pageY); });
+      chunk.addEventListener('mouseleave',hideTip);
+
+      bar.appendChild(chunk);
+    });
+    return bar;
+  }
+
+  function compactCalendarList(items){
+    if(!items.length) return '<div class="iw-cal-item">No accepted events</div>';
+    return items.map(e=>{
+      const title=(e.private || e.title==='(Private)')?'Private':(e.title||'Accepted event');
+      return `<div class="iw-cal-item">• ${title} — ${fmtHM(e.minutes)}</div>`;
+    }).join('');
+  }
+
+  // ====== Timeline (two-column) view used on the Insights drawer ======
+  (function(){
+    // --- robust date helpers (PATCHED) ---
+    function isoDay(input){
+      // Always return YYYY-MM-DD, no .toISOString() on raw strings.
+      if (input instanceof Date) {
+        const d = new Date(input);
+        d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+        return d.toISOString().slice(0,10);
+      }
+      if (typeof input === 'string') {
+        // If it's already YYYY-MM-DD, accept; otherwise try to parse
+        if (/^\d{4}-\d{2}-\d{2}$/.test(input)) return input;
+        const d = new Date(input);
+        if (!isNaN(d)) {
+          d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+          return d.toISOString().slice(0,10);
+        }
+      }
+      const d = new Date();
+      d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+      return d.toISOString().slice(0,10);
+    }
+    function hm(d){ return new Date(d).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); }
+    function clamp(n, a, b){ return Math.max(a, Math.min(b, n)); }
+
+    // Public: host by FlowLogic (name kept the same)
+    window.renderInsightsCalendarAndStates = function(mount, startISO, endISO){
+      // Normalise inputs (today for calendar by default)
+      const start = isoDay(startISO || new Date());
+      const end = isoDay(endISO || start);
+
+      // Visual constants
+      const START_H = 7, END_H = 20, PX_PER_HOUR = 40;
+      const PX_TOTAL = (END_H - START_H) * PX_PER_HOUR;
+      const pxPerMin = PX_PER_HOUR / 60;
+
+      // Skeleton
+      mount.innerHTML = `
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+          <div class="card">
+            <div class="small" style="font-weight:700;margin-bottom:6px;">States</div>
+            <div id="iwStatesGrid" style="position:relative;height:${PX_TOTAL}px;border:1px solid #e5e7eb;border-radius:12px;padding-left:54px;background:#fff;overflow:hidden;">
+              ${Array.from({length:(END_H-START_H)+1},(_,i)=>`<div style="position:absolute;left:0;right:0;top:${i*PX_PER_HOUR}px;height:0;border-top:1px dashed #e5e7eb"><div style="position:absolute;left:6px;top:-9px;font-size:12px;color:#9ca3af">${String(START_H+i).padStart(2,'0')}:00</div></div>`).join('')}
+            </div>
+          </div>
+          <div class="card">
+            <div class="small" style="font-weight:700;margin-bottom:6px;">Calendar</div>
+            <div id="iwCalGrid" style="position:relative;height:${PX_TOTAL}px;border:1px solid #e5e7eb;border-radius:12px;padding-left:54px;background:#fff;overflow:hidden;">
+              ${Array.from({length:(END_H-START_H)+1},(_,i)=>`<div style="position:absolute;left:0;right:0;top:${i*PX_PER_HOUR}px;height:0;border-top:1px dashed #e5e7eb"><div style="position:absolute;left:6px;top:-9px;font-size:12px;color:#9ca3af">${String(START_H+i).padStart(2,'0')}:00</div></div>`).join('')}
+            </div>
+          </div>
+        </div>
+      `;
+
+      const sHost = mount.querySelector('#iwStatesGrid');
+      const cHost = mount.querySelector('#iwCalGrid');
+
+      const S_COLORS = {
+        LoggedOut:'#fde2e2', Break:'#fee2e2', Lunch:'#fee2e2',
+        Meeting:'#e8ecff', Working:'#dff7ee', Admin:'#fff3cd', Administration:'#fff3cd', Idle:'#f3f4f6'
+      };
+
+      function addBlock(parentEl, startIso, endIso, label, color){
+        if (!parentEl || !startIso || !endIso) return;
+        const s = new Date(startIso), e = new Date(endIso);
+        if (isNaN(s) || isNaN(e) || e <= s) return;
+
+        const dayStart = new Date(isoDay(s)+'T00:00:00');
+        const yStart = ((s - dayStart)/60000 - START_H*60) * pxPerMin;
+        const yEnd = ((e - dayStart)/60000 - START_H*60) * pxPerMin;
+        const top = clamp(yStart, 0, PX_TOTAL);
+        const height = Math.max(18, Math.min(PX_TOTAL-top, yEnd - top));
+        if (height <= 0) return;
+
+        const el = document.createElement('div');
+        el.style.cssText = `
+          position:absolute;left:60px;right:10px;top:${top}px;height:${height}px;
+          border-radius:10px;background:${color||'#e5e7eb'};border:1px solid rgba(0,0,0,0.05);
+          box-shadow:0 1px 2px rgba(0,0,0,0.05);display:flex;align-items:flex-start;padding:6px 8px;
+          font-weight:700;color:#374151;
+        `;
+        el.title = `${label||''}\n${hm(s)} → ${hm(e)}`;
+        el.textContent = label || '';
+        parentEl.appendChild(el);
+      }
+
+      // Pull data (single endpoint)
+      google.script.run
+        .withSuccessHandler(res=>{
+          const states = Array.isArray(res?.state_segments) ? res.state_segments : [];
+          const meetings = Array.isArray(res?.calendar) ? res.calendar : [];
+
+          // STATES
+          if (!states.length) {
+            sHost.innerHTML += `<div class="small" style="position:absolute;left:60px;top:6px;color:#9ca3af">No state entries.</div>`;
+          } else {
+            states.forEach((s)=>{
+              const c = S_COLORS[s.state] || S_COLORS.Idle;
+              addBlock(sHost, s.start_iso || s.start_ts, s.end_iso || s.end_ts, s.state || 'State', c);
+            });
+          }
+
+          // CALENDAR
+          if (!meetings.length) {
+            cHost.innerHTML += `<div class="small" style="position:absolute;left:60px;top:6px;color:#9ca3af">No accepted events.</div>`;
+          } else {
+            meetings.forEach(ev=>{
+              const s = ev.start_iso || (ev.date ? ev.date+'T00:00:00' : null);
+              let e = ev.end_iso;
+              if (!e && ev.minutes != null && s){
+                const sd = new Date(s);
+                e = new Date(sd.getTime() + Math.max(0, Number(ev.minutes)||0)*60000).toISOString();
+              }
+              const title = (ev.private || ev.title==='(Private)') ? 'Private' : (ev.title || 'Accepted meeting');
+              addBlock(cHost, s, e, title, S_COLORS.Meeting);
+            });
+          }
+        })
+        .withFailureHandler(err=>{
+          sHost.innerHTML = `<div class="small" style="padding:8px;color:#b91c1c">States error: ${(err && err.message)||err}</div>`;
+          cHost.innerHTML = `<div class="small" style="padding:8px;color:#b91c1c">Calendar error: ${(err && err.message)||err}</div>`;
+        })
+        .getAnalystInsights(start, end);
+    };
+  })();
+})();
+</script>
