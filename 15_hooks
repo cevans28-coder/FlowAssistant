@@ -1,0 +1,100 @@
+/******************************************************
+ * 15_hooks.gs — Post-event hooks (called after logging a check)
+ * Depends on:
+ * - SHEETS, TZ (00_constants.gs)
+ * - normId_, toISODate_, indexMap_ (01_utils.gs)
+ * - master_(), getOrCreateMasterSheet_() (02_master_access.gs)
+ * - updateLiveKPIsFor_(), computeDailyMetricsRow_ (07_metrics.gs)
+ * - upsertDailyTypeSummaryFor_(analystId, dateISO) (14_rollups.gs)
+ *
+ * What this does:
+ * - postCheckHooks_(analystId, dateISO): refreshes per-type daily summary,
+ * recomputes & REPLACES the DailyMetrics row (feature-flag), and nudges Live KPIs.
+ * - postCheckHooksFromNow_(): wrapper for current user, today.
+ * - replaceDailyMetricsRow_(): safe replace/append for one DailyMetrics row.
+ ******************************************************/
+
+/** Toggle this on/off if you want DailyMetrics to be recomputed each submission. */
+var ENABLE_DAILY_REPLACE_ON_EACH_CHECK = true;
+
+/**
+ * Call this right AFTER you append a row to CheckEvents for a given analyst+date.
+ * Safe and idempotent.
+ */
+function postCheckHooks_(analystId, dateISO) {
+  if (!analystId) analystId = getCurrentAnalystId_();
+  if (!dateISO) dateISO = toISODate_(new Date());
+
+  // 1) Refresh the per-type daily rollup
+  try {
+    if (typeof upsertDailyTypeSummaryFor_ === 'function') {
+      upsertDailyTypeSummaryFor_(analystId, dateISO);
+    }
+  } catch (e) {
+    Logger.log('postCheckHooks_: upsertDailyTypeSummaryFor_ error: ' + (e && e.message));
+  }
+
+  // 2) (Optional) Recompute & replace the DailyMetrics row for this analyst+date
+  if (ENABLE_DAILY_REPLACE_ON_EACH_CHECK) {
+    try {
+      if (typeof computeDailyMetricsRow_ === 'function') {
+        var rowObj = computeDailyMetricsRow_(analystId, dateISO);
+        replaceDailyMetricsRow_(analystId, dateISO, rowObj);
+      }
+    } catch (e) {
+      Logger.log('postCheckHooks_: compute/replace DailyMetrics error: ' + (e && e.message));
+    }
+  }
+
+  // 3) Nudge LIVE KPIs so TL Console sees fresh numbers straight away
+  try {
+    if (typeof updateLiveKPIsFor_ === 'function') {
+      updateLiveKPIsFor_(analystId);
+    }
+  } catch (e) {
+    Logger.log('postCheckHooks_: updateLiveKPIsFor_ error: ' + (e && e.message));
+  }
+}
+
+/** Convenience wrapper for UI paths without explicit params. */
+function postCheckHooksFromNow_() {
+  return postCheckHooks_(getCurrentAnalystId_(), toISODate_(new Date()));
+}
+
+/* ------------------ DailyMetrics replace helper ------------------ */
+/**
+ * Replace one DailyMetrics row (analyst+date) if present; otherwise append.
+ * Aligns to the current DailyMetrics header. Unknown keys ignored.
+ */
+function replaceDailyMetricsRow_(analystId, dateISO, rowObj) {
+  var ss = master_();
+  var sh = ss.getSheetByName(SHEETS.DAILY);
+  if (!sh || sh.getLastRow() < 1) return;
+
+  var v = sh.getDataRange().getValues();
+  var hdr = (v[0] || []).map(String);
+  var idx = indexMap_(hdr);
+  var A_COL = idx['analyst_id'];
+  var D_COL = idx['date'];
+  if (A_COL == null || D_COL == null) return;
+
+  // find existing row
+  var row = -1;
+  for (var r = 1; r < v.length; r++) {
+    var a = String(v[r][A_COL] || '');
+    var d = String(v[r][D_COL] || '');
+    if (normId_(a) === normId_(analystId) && d === dateISO) { row = r + 1; break; }
+  }
+
+  // build output array aligned to header
+  var out = new Array(hdr.length).fill('');
+  Object.keys(rowObj || {}).forEach(function(k){
+    if (Object.prototype.hasOwnProperty.call(idx, k)) out[idx[k]] = rowObj[k];
+  });
+
+  if (row === -1) {
+    sh.appendRow(out);
+  } else {
+    sh.getRange(row, 1, 1, hdr.length).setValues([out]);
+  }
+}
