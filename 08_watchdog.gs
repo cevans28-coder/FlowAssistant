@@ -2,13 +2,13 @@
  * 08_watchdog.gs — Inactivity rules & gentle nudges (optimized)
  * Depends on:
  * - TZ, SHEETS (00_constants.gs)
- * - toISODate_, minutesBetween_, normId_, readRows_ (01_utils.gs)
+ * - toISODate_, minutesBetween_, normId_ (01_utils.gs)
  * - master_(), getOrCreateMasterSheet_() (02_master_access.gs)
  * - getCurrentAnalystId_(), getSessionTokenFor_(), logLoginEvent_() (03_sessions.gs)
  * - upsertLive_() (04_state_engine.gs)
  *
  * Triggers (installed by ensureUserTriggers_ in 99_triggers.gs):
- * - watchdog_heartbeat_10min() — every 10 minutes per user
+ * - watchdog_heartbeat_10min() — every ~10 minutes per user
  *
  * Behaviour:
  * - If no heartbeat in >10m while Working/Admin → set Idle
@@ -17,100 +17,83 @@
  * - All other states (Meeting/Training/Coaching/OOO/…) with >10m gap → LoggedOut
  *
  * Notes:
- * - We write ONE StatusLogs row only when a transition is required.
- * - We keep Live in sync and add an audit in LoginHistory.
+ * - Writes ONE StatusLogs row only when a transition is required.
+ * - Keeps Live (v1) in sync and audits in LoginHistory.
+ * - Optimized: reads only the needed columns from StatusLogs.
  ******************************************************/
 
-/**
- * Watchdog — per-user trigger every ~10m.
- * Uses last_seen_iso from PropertiesService(User) (set by heartbeat()).
- * Writes to StatusLogs only if a state transition is needed.
- */
+/** Fast lookup of today's latest state row for an analyst (reads 4 columns only). */
+function _getLatestStateTodayFast_(ss, dateISO, analystIdNorm) {
+  const sh = ss.getSheetByName(SHEETS.STATUS_LOGS);
+  if (!sh || sh.getLastRow() < 2) return { state: 'Idle', ts: null, source: '' };
+
+  // Header map
+  const hdr = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(String);
+  const H = (name)=> hdr.indexOf(name);
+  const cDate = H('date'), cAid = H('analyst_id'), cTs = H('timestamp_iso'), cState = H('state'), cSrc = H('source');
+  if (cDate < 0 || cAid < 0 || cTs < 0 || cState < 0) return { state: 'Idle', ts: null, source: '' };
+
+  const nRows = sh.getLastRow() - 1;
+  // Pull just these columns as arrays
+  const colDate = sh.getRange(2, cDate + 1, nRows, 1).getValues().map(r => String(r[0] || ''));
+  const colAid = sh.getRange(2, cAid + 1, nRows, 1).getValues().map(r => normId_(r[0] || ''));
+  const colTs = sh.getRange(2, cTs + 1, nRows, 1).getValues().map(r => new Date(r[0]));
+  const colState = sh.getRange(2, cState + 1, nRows, 1).getValues().map(r => String(r[0] || ''));
+  const colSrc = (cSrc >= 0)
+    ? sh.getRange(2, cSrc + 1, nRows, 1).getValues().map(r => String(r[0] || ''))
+    : new Array(nRows).fill('');
+
+  let bestIdx = -1;
+  let bestTime = 0;
+  for (let i = 0; i < nRows; i++) {
+    if (colDate[i] !== dateISO) continue;
+    if (colAid[i] !== analystIdNorm) continue;
+    const t = colTs[i] instanceof Date && !isNaN(colTs[i]) ? colTs[i].getTime() : 0;
+    if (t >= bestTime) { bestTime = t; bestIdx = i; }
+  }
+
+  if (bestIdx === -1) return { state: 'Idle', ts: null, source: '' };
+  return {
+    state: colState[bestIdx] || 'Idle',
+    ts: (colTs[bestIdx] instanceof Date && !isNaN(colTs[bestIdx])) ? colTs[bestIdx] : null,
+    source: colSrc[bestIdx] || ''
+  };
+}
+
 function watchdog_heartbeat_10min() {
-  // 0) Read last heartbeat. If never set, we can’t infer inactivity → skip.
-  const up = PropertiesService.getUserProperties();
-  const last = up.getProperty('last_seen_iso');
-  if (!last) return;
+  // Only enforce Idle > 60m => LoggedOut. Do not infer idle from missing heartbeats.
+  var ss = master_();
+  var id = getCurrentAnalystId_();
 
-  const now = new Date();
-  const lastDt = new Date(last);
-  const gap = minutesBetween_(lastDt, now);
-  if (gap <= 10) return; // still fresh; nothing to do
+  var live = ss.getSheetByName(SHEETS.LIVE);
+  if (!live || live.getLastRow() < 2) return;
 
-  const id = getCurrentAnalystId_();
-  const today = toISODate_(now);
-  const ss = master_();
-
-  // 1) Read today’s last known state for this user
-  const statusRows = readRows_(ss.getSheetByName(SHEETS.STATUS_LOGS))
-    .filter(r => r.date_str === today && r.analyst_id_norm === id)
-    .sort((a, b) => a.ts - b.ts);
-
-  const lastRow = statusRows[statusRows.length - 1] || null;
-  const lastState = lastRow ? String(lastRow.state || '') : 'Idle';
-  const lastSrc = (lastRow ? String(lastRow.source || '') : '').toLowerCase();
-
-  // If the last write came from watchdog already, avoid spamming,
-  // but still allow the Idle→LoggedOut escalation (>60m)
-  if (lastRow && lastSrc.indexOf('watchdog') !== -1) {
-    if (!(lastState === 'Idle' && gap > 60)) return;
+  var v = live.getDataRange().getValues();
+  var idx = indexMap_(v[0].map(String));
+  var row = null;
+  for (var r=1; r<v.length; r++){
+    if (normId_(v[r][idx['analyst_id']]) === id){ row = v[r]; break; }
   }
+  if (!row) return;
 
-  // Helper to append to StatusLogs + LIVE + audit in one shot
-  function writeTransition_(newState, note) {
-    const sh = getOrCreateMasterSheet_(SHEETS.STATUS_LOGS,
-      ['timestamp_iso','date','analyst_id','state','source','note']);
+  var lastState = String(row[idx['state']] || 'Idle');
+  var sinceIso = String(row[idx['since_iso']] || '');
+  if (lastState !== 'Idle' || !sinceIso) return;
 
-    sh.appendRow([now.toISOString(), today, id, newState, 'watchdog', note]);
+  var since = new Date(sinceIso);
+  if (!(since instanceof Date) || isNaN(since)) return;
 
-    // Keep Live view consistent
-    upsertLive_(id, {
-      analyst_id: id,
-      online: (newState === 'LoggedOut') ? 'NO' : 'NO', // when watchdog mutates, mark NO
-      last_seen_iso: now.toISOString(),
-      state: newState,
-      since_iso: now.toISOString()
-    });
-
-    // Audit trail for session events
-    const token = getSessionTokenFor_(id);
-    logLoginEvent_(
-      newState === 'Idle' ? 'WatchdogIdle' : 'WatchdogLogout',
-      note,
-      token
-    );
+  var idleMins = minutesBetween_(since, new Date());
+  if (idleMins >= 60) {
+    appendStatusLogSmart_(id, 'LoggedOut', 'watchdog', 'Auto-logout: Idle ≥ 60m', new Date());
+    try { refreshLiveFor_(id); } catch(e){}
+    try { updateLiveKPIsFor_(id); } catch(e){}
   }
-
-  /* =================== RULES =================== */
-
-  // Break/Lunch: allow up to 60m without heartbeat, then logout
-  if (lastState === 'Break' || lastState === 'Lunch') {
-    if (gap > 60) writeTransition_('LoggedOut', 'Break/Lunch >60m with no heartbeat');
-    return;
-  }
-
-  // Working/Admin: after >10m without heartbeat → auto-Idle (softer)
-  if (lastState === 'Working' || lastState === 'Admin') {
-    writeTransition_('Idle', 'Auto-idle: no heartbeat >10m');
-    return;
-  }
-
-  // Idle: after >60m → LoggedOut
-  if (lastState === 'Idle') {
-    if (gap > 60) writeTransition_('LoggedOut', 'Idle >60m with no heartbeat');
-    return;
-  }
-
-  // Other states (Meeting/Training/Coaching/OOO/…):
-  // If no heartbeat for >10m, assume they are gone → LoggedOut
-  writeTransition_('LoggedOut', 'No heartbeat >10m');
 }
 
 /**
- * Optional nudge:
- * If you are currently in a (accepted) calendar meeting but your state is Working,
- * send yourself a polite email reminder to update your state.
- * Safe to call from the 10-minute cycle; errors are swallowed.
+ * Nudge: if you’re in an accepted calendar meeting right now but your state is Working,
+ * send a gentle email reminder. Uses CalendarPull_v2 via SHEETS.CAL_PULL.
  */
 function nudgeIfInMeetingButWorking_() {
   try {
@@ -119,29 +102,39 @@ function nudgeIfInMeetingButWorking_() {
     const id = getCurrentAnalystId_();
     const ss = master_();
 
-    const calRows = readRows_(ss.getSheetByName(SHEETS.CAL_PULL))
-      .filter(r => r.date_str === dateISO &&
-                   r.analyst_id_norm === id &&
-                   String(r.my_status || '').toLowerCase() === 'accepted');
+    // CalendarPull_v2 (SHEETS.CAL_PULL should point to the v2 tab)
+    const sh = ss.getSheetByName(SHEETS.CAL_PULL);
+    if (!sh || sh.getLastRow() < 2) return;
 
-    const inMeeting = calRows.some(r => r.start && r.end && now >= r.start && now <= r.end);
+    const v = sh.getDataRange().getValues();
+    const idx = (function(h){ const m={}; h.forEach((x,i)=>m[String(x)] = i); return m; })(v[0].map(String));
+    const cDate = idx['date'], cAid = idx['analyst_id'], cStart = idx['start_iso'], cEnd = idx['end_iso'], cStatus = idx['my_status'];
+    if ([cDate,cAid,cStart,cEnd,cStatus].some(x=> x==null)) return;
+
+    const idNorm = normId_(id);
+    let inMeeting = false;
+    for (let r=1; r<v.length; r++){
+      if (String(v[r][cDate]) !== dateISO) continue;
+      if (normId_(v[r][cAid]) !== idNorm) continue;
+      const status = String(v[r][cStatus] || '').toLowerCase();
+      if (!['accepted','accept','yes','y'].includes(status)) continue;
+      const s = new Date(v[r][cStart]); const e = new Date(v[r][cEnd]);
+      if (s instanceof Date && !isNaN(s) && e instanceof Date && !isNaN(e) && now >= s && now <= e) { inMeeting = true; break; }
+    }
     if (!inMeeting) return;
 
-    const statusRows = readRows_(ss.getSheetByName(SHEETS.STATUS_LOGS))
-      .filter(r => r.date_str === dateISO && r.analyst_id_norm === id)
-      .sort((a, b) => a.ts - b.ts);
+    // Latest state fast
+    const latest = _getLatestStateTodayFast_(ss, dateISO, idNorm);
+    if (String(latest.state || '') !== 'Working') return;
 
-    const last = statusRows[statusRows.length - 1];
-    if (last && String(last.state) === 'Working') {
-      const email = Session.getActiveUser().getEmail() || Session.getEffectiveUser().getEmail();
-      if (!email) return;
-      try {
-        MailApp.sendEmail({
-          to: email,
-          subject: 'Flow Assistant — quick reminder',
-          htmlBody: 'We detected you appear to be in a meeting, but your state is <b>Working</b>. Want to switch to <b>Meeting</b>?'
-        });
-      } catch (e) { /* ignore email errors */ }
-    }
-  } catch (e) { /* swallow to keep trigger healthy */ }
+    const email = Session.getActiveUser().getEmail() || Session.getEffectiveUser().getEmail();
+    if (!email) return;
+    MailApp.sendEmail({
+      to: email,
+      subject: 'Horizon — quick reminder',
+      htmlBody: 'We detected you appear to be in a meeting, but your state is <b>Working</b>. Want to switch to <b>Meeting</b>?'
+    });
+  } catch (e) {
+    // swallow to keep trigger healthy
+  }
 }
