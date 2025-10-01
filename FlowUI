@@ -3,14 +3,24 @@
 <head>
   <meta charset="utf-8" />
   <base target="_top">
+  <title>Horizon Log</title>
+
+  <!-- Favicon -->
+  <link rel="icon" type="image/svg+xml"
+        href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' ry='20' fill='%236c2bd9'/%3E%3Ctext x='50' y='65' font-size='60' text-anchor='middle' fill='%2300c2a8' font-family='Arial, sans-serif'%3EF%3C/text%3E%3C/svg%3E">
+
   <style>
     :root{
       --bg:#ffffff; --fg:#0b0f1a; --muted:#6b7280; --line:#e5e7eb;
       --brand:#6c2bd9; --brand-2:#00c2a8; --chip:#f6f7fb;
       --ok:#1bb36e; --warn:#f59e0b; --idle:#9aa3af; --danger:#e11d48;
+      --overlay-bg: rgba(17, 24, 39, 0.5);
+      --drawer-w: min(940px, 92vw);
     }
     *{ box-sizing:border-box; }
     html, body{ margin:0; padding:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; }
+    a{ color:inherit; }
+
     header{
       padding:10px 12px; position:sticky; top:0; z-index:5;
       background:linear-gradient(180deg,#f7f7fb 0%, #ffffff 100%);
@@ -19,25 +29,32 @@
     }
     .title{ display:flex; gap:8px; align-items:center; font-weight:800; color:#1f2937; }
     .title .brandDot{ width:10px; height:10px; border-radius:999px; background:linear-gradient(135deg,var(--brand),var(--brand-2)); box-shadow:0 0 0 3px #ebe9f6 inset; }
-    .actions{ display:flex; gap:6px; align-items:center; }
-    .wrap{ padding:12px; display:grid; gap:12px; }
-    .row{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-    .card{
-      border:1px solid var(--line); border-radius:14px; padding:12px; background:#fff;
-      box-shadow:0 1px 0 rgba(17,24,39,0.02);
-    }
-    button, select, input{ font:inherit; padding:8px 12px; border:1px solid var(--line); border-radius:10px; background:#fafafa; }
-    button.primary{ background:var(--brand); color:#fff; border-color:var(--brand); }
-    button.primary:hover{ filter:brightness(1.05); }
-    .small{ font-size:12px; color:var(--muted); }
-    .loading{ opacity:0.6; pointer-events:none; }
-    .hidden{ display:none; }
+    .actions{ display:flex; gap:8px; align-items:center; }
     .icon{
       cursor:pointer; width:28px; height:28px; border:1px solid var(--line); border-radius:8px;
       display:inline-grid; place-items:center; user-select:none; background:#fff;
     }
     .icon:hover{ background:#f3f4f6; }
+    #profileMount{ display:flex; }
 
+    .wrap{ padding:12px; display:grid; gap:12px; }
+
+    .card{
+      border:1px solid var(--line); border-radius:14px; padding:12px; background:#fff;
+      box-shadow:0 1px 0 rgba(17,24,39,0.02);
+    }
+    .row{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .small{ font-size:12px; color:var(--muted); }
+    .loading{ opacity:0.6; pointer-events:none; }
+    .hidden{ display:none; }
+
+    button, select, input, textarea{
+      font:inherit; padding:8px 12px; border:1px solid var(--line); border-radius:10px; background:#fafafa;
+    }
+    button.primary{ background:var(--brand); color:#fff; border-color:var(--brand); }
+    button.primary:hover{ filter:brightness(1.05); }
+
+    /* Status badge */
     .status{
       display:inline-flex; align-items:center; gap:6px;
       padding:6px 12px; border-radius:999px; background:var(--chip); border:1px solid var(--line);
@@ -48,7 +65,6 @@
     .dot.warn{ background:var(--warn); }
     .dot.idle{ background:var(--idle); }
     .dot.danger{ background:var(--danger); }
-    .stateText{ display:inline-flex; align-items:center; gap:6px; font-size:18px; }
 
     .state-menu{
       position:absolute; margin-top:6px; padding:6px; border:1px solid var(--line); background:#fff; border-radius:12px;
@@ -64,38 +80,96 @@
       border:1px solid var(--line); border-radius:8px; background:#f9fafb;
     }
 
-    /* ==== Exception modal (additive styles) ==== */
-    .modal-backdrop{
-      position:fixed; inset:0; background:rgba(0,0,0,0.25); display:none; z-index:30;
+    /* Timer panels & tabs */
+    .toolbar{ display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; }
+    .tabs{ display:flex; gap:6px; }
+    .tab{
+      padding:6px 10px; border:1px solid var(--line); border-radius:8px; background:#fff; cursor:pointer;
     }
-    .modal{
-      position:fixed; inset:0; display:none; z-index:31;
-      align-items:center; justify-content:center; padding:20px;
+    .tab.active{ background:var(--brand); color:#fff; border-color:transparent; }
+
+    .timer-card{ border:1px solid var(--line); border-radius:14px; background:#fff; padding:12px; }
+    .timer-head{ display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; }
+    .timer-title{ font-weight:700; }
+    .timer-actions{ display:flex; gap:8px; flex-wrap:wrap; }
+    .timer-row{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:6px; }
+    .timer-grid{ display:grid; grid-template-columns: 1fr 1fr 1fr; gap:8px; align-items:end; }
+    .field{ display:grid; gap:6px; }
+    .field label{ font-size:12px; color:var(--muted); }
+
+    .divider { height:1px; background:var(--line); margin:8px 0; }
+
+    /* Profile modal */
+    .profile-btn{
+      border:1px solid var(--line,#e5e7eb); background:#fff; border-radius:999px; padding:6px 10px; cursor:pointer;
+      display:inline-flex; align-items:center; gap:8px; font-weight:700;
     }
+    .avatar{
+      width:22px; height:22px; border-radius:999px; background:var(--brand); color:#fff;
+      display:inline-flex; align-items:center; justify-content:center; font-size:12px;
+    }
+    .modal-backdrop{ position:fixed; inset:0; background:rgba(0,0,0,.35); display:none; z-index:30; }
+    .modal{ position:fixed; inset:0; display:none; z-index:31; align-items:center; justify-content:center; padding:20px; }
     .modal.show, .modal-backdrop.show{ display:flex; }
-    .modal-content{
-      width:100%; max-width:520px; background:#fff; border:1px solid var(--line);
-      border-radius:16px; padding:16px; box-shadow:0 20px 40px rgba(0,0,0,0.12);
+    .modal > .panel{
+      width:100%; max-width:520px; background:#fff; border:1px solid var(--line,#e5e7eb);
+      border-radius:12px; overflow:hidden; box-shadow:0 20px 40px rgba(0,0,0,0.12);
     }
-    .modal-content h3{ margin:0 0 8px 0; }
-    .modal-content label{ display:block; margin:8px 0 2px; font-weight:600; }
-    .modal-content input[type="date"],
-    .modal-content input[type="time"],
-    .modal-content select,
-    .modal-content textarea{
-      width:100%; background:#fafafa; border:1px solid var(--line); border-radius:10px; padding:8px 10px;
+    .modal header{ padding:12px 14px; border-bottom:1px solid var(--line,#eee); font-weight:800; display:flex; justify-content:space-between; align-items:center; }
+    .modal .body{ padding:12px 14px; display:grid; gap:10px; }
+    .modal .actions{ padding:12px 14px; border-top:1px solid var(--line,#eee); display:flex; justify-content:flex-end; gap:8px; }
+    .xbtn, .primary{ appearance:none; border:1px solid var(--line,#e5e7eb); background:#fff; padding:8px 12px; border-radius:8px; cursor:pointer; font-weight:700; }
+    .primary{ background:var(--brand,#6c2bd9); color:#fff; border-color:transparent; }
+
+    /* Hide “since” clock if desired */
+    #stateTimer { display:none !important; }
+
+    /* Insights Drawer */
+    .insights-toggle{
+      position: fixed; right: 12px; top: 50%; transform: translateY(-50%);
+      z-index: 40; border-radius: 999px; padding: 10px 12px; font-weight:800;
+      border:1px solid var(--line); background:#fff; box-shadow:0 6px 20px rgba(0,0,0,0.08);
+      cursor:pointer;
     }
-    .modal-content textarea{ min-height:90px; resize:vertical; }
-    .modal-actions{ display:flex; gap:8px; justify-content:flex-end; margin-top:12px; }
+    .insights-backdrop{
+      position: fixed; inset:0; background: var(--overlay-bg); opacity:0; pointer-events:none; transition: opacity .18s ease;
+      z-index: 45;
+    }
+    .insights-backdrop.show{ opacity:1; pointer-events:auto; }
+    .insights-drawer{
+      position: fixed; top:0; right:0; bottom:0; width: var(--drawer-w);
+      background:#fff; border-left:1px solid var(--line);
+      box-shadow: -24px 0 60px rgba(0,0,0,0.18);
+      transform: translateX(100%); transition: transform .22s ease;
+      z-index: 46; display:flex; flex-direction:column;
+    }
+    .insights-drawer.show{ transform: translateX(0); }
+
+    .insights-head{
+      padding:12px 14px; border-bottom:1px solid var(--line); display:flex; align-items:center; justify-content:space-between;
+    }
+    .insights-title{ font-weight:800; display:flex; gap:8px; align-items:center; }
+    .insights-close{ border:1px solid var(--line); background:#fff; border-radius:8px; font-weight:800; cursor:pointer; padding:6px 10px; }
+
+    .insights-tabs{ display:flex; gap:6px; padding:12px; border-bottom:1px solid var(--line); }
+    .insights-tab{ padding:6px 10px; border:1px solid var(--line); border-radius:8px; background:#fff; cursor:pointer; }
+    .insights-tab.active{ background:var(--brand); color:#fff; border-color:transparent; }
+
+    .insights-body{ flex:1; overflow:auto; padding:12px; background:#fafafa; }
+    .insights-panel{ display:none; }
+    .insights-panel.active{ display:block; }
   </style>
 </head>
 <body>
   <header>
-    <div class="title"><span class="brandDot"></span> Flow Assistant V2.0 <span class="small" id="who"></span></div>
+    <div class="title">
+      <span class="brandDot"></span>
+      Horizon Log
+      <span class="small" id="who"></span>
+    </div>
     <div class="actions">
-      <!-- NEW: Report Exception button (analysts) -->
+      <div id="profileMount"></div>
       <button id="btnAddException" class="xbtn">➕ Report Exception</button>
-
       <div class="icon" id="btnPop" title="Open in a standalone tab">⤢</div>
       <div class="icon" id="btnMin" title="Minimise">—</div>
       <div class="icon" id="btnLogOff" title="Log Off">⏻</div>
@@ -103,18 +177,15 @@
   </header>
 
   <div class="wrap" id="content">
-
+    <!-- Register / Session -->
     <div class="card" id="card-register">
       <div class="row" style="justify-content:space-between; width:100%;">
-        <div><button id="btnRegister">Log in/ Register</button></div>
-        <div class="small">Baseline hours:
-          <input id="baselineHours" type="number" min="1" step="0.5" style="width:92px" />
-          <button id="btnSaveBaseline" title="Save your daily contracted hours">Save</button>
-          <span id="baselineMsg" class="small"></span>
-        </div>
+        <div><button id="btnRegister">Start / Register</button></div>
+        <div class="small">Signed in user appears at top left after start.</div>
       </div>
     </div>
 
+    <!-- State badge -->
     <div class="card" id="card-state" style="position:relative;">
       <div class="row" style="margin-top:6px;">
         <span>Current state:</span>
@@ -128,101 +199,361 @@
       <div id="stateMsg" class="small" style="margin-top:6px;"></div>
     </div>
 
+    <!-- Working Location (editable times all day, location chosen once) -->
     <div class="card">
       <b>Working Location (once per day)</b><br/>
-      <select id="workLocation">
-        <option value="">— Select —</option>
-        <option value="Home">Home</option>
-        <option value="Office">Office</option>
-      </select>
-      <button id="btnSaveLocation">Save</button>
-      <div id="locMsg" class="small"></div>
+      <div class="row" style="margin-top:6px; gap:8px; align-items:end;">
+        <div class="field">
+          <label for="workLocation" class="small">Location</label>
+          <select id="workLocation">
+            <option value="">— Select —</option>
+            <option value="Home">Home</option>
+            <option value="Office">Office</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="workStart" class="small">Start</label>
+          <input id="workStart" type="time" />
+        </div>
+
+        <div class="field">
+          <label for="workEnd" class="small">End</label>
+          <input id="workEnd" type="time" />
+        </div>
+
+        <div class="field">
+          <label for="workLunch" class="small">Lunch (mins)</label>
+          <input id="workLunch" type="number" min="0" step="5" value="60" />
+        </div>
+
+        <button id="btnSaveLocation">Save</button>
+        <div id="locMsg" class="small"></div>
+      </div>
     </div>
 
+    <!-- Timers + Logging -->
     <div class="card">
-      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:6px;">
-        <b>Check Timer</b>
-        <span id="checkTimerDisplay" class="timer">00:00:00</span>
-        <button id="btnStartCheck" disabled>Start</button>
-        <button id="btnPauseCheck" disabled>Pause</button>
-        <button id="btnEndCheck" disabled>End</button>
-        <span class="small" id="timerMsg"></span>
+      <div class="toolbar">
+        <div class="tabs">
+          <button id="timerTabA" class="tab active" data-tab="A">1</button>
+          <button id="timerTabB" class="tab" data-tab="B">2</button>
+          <button id="timerTabC" class="tab" data-tab="C">3</button>
+          <button id="timerTabD" class="tab" data-tab="D">4</button>
+        </div>
       </div>
 
-      <div class="row" style="gap:6px;">
-        <label for="checkType"><b>Complete Check</b></label>
-        <select id="checkType" title="Check Type"></select>
-        <input id="caseId" placeholder="Case ID (MP scorecard UID) *" />
-        <input id="duration" type="number" min="1" step="1" style="width:150px" placeholder="Minutes *" />
-        <button class="primary" id="btnComplete">Log</button>
+      <!-- Panel A -->
+      <div id="timerPanelA" class="timer-card">
+        <div class="timer-head">
+          <div class="timer-title">Check 1</div>
+          <div class="timer-row">
+            <span id="timerDisplay-A" class="timer">00:00:00</span>
+            <div class="timer-actions">
+              <button id="btnStart-A">Start</button>
+              <button id="btnPause-A" disabled>Pause</button>
+              <button id="btnEnd-A" disabled>End</button>
+              <button id="btnReset-A">Reset timer</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="timer-grid">
+          <div class="field">
+            <label for="checkType-A">Check Type</label>
+            <select id="checkType-A"></select>
+          </div>
+          <div class="field">
+            <label for="caseId-A">Scorecard UID</label>
+            <input id="caseId-A" placeholder="e.g. MP-123456" />
+          </div>
+          <div class="field">
+            <label for="duration-A">Minutes</label>
+            <input id="duration-A" type="number" min="1" step="1" />
+          </div>
+        </div>
+
+        <div class="field" style="margin-top:8px;">
+          <label for="note-A">Note (optional)</label>
+          <input id="note-A" placeholder="Short label to help you recognise this case" />
+        </div>
+
+        <div class="timer-actions" style="margin-top:8px;">
+          <button id="btnLog-A" class="primary">Log</button>
+          <span id="timerMsg-A" class="small"></span>
+        </div>
       </div>
-      <div class="small">* required fields</div>
-      <div id="checkMsg" class="small"></div>
+
+      <!-- Panel B -->
+      <div id="timerPanelB" class="timer-card hidden">
+        <div class="timer-head">
+          <div class="timer-title">Check 2</div>
+          <div class="timer-row">
+            <span id="timerDisplay-B" class="timer">00:00:00</span>
+            <div class="timer-actions">
+              <button id="btnStart-B">Start</button>
+              <button id="btnPause-B" disabled>Pause</button>
+              <button id="btnEnd-B" disabled>End</button>
+              <button id="btnReset-B">Reset timer</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="timer-grid">
+          <div class="field">
+            <label for="checkType-B">Check Type</label>
+            <select id="checkType-B"></select>
+          </div>
+          <div class="field">
+            <label for="caseId-B">Scorecard UID</label>
+            <input id="caseId-B" placeholder="e.g. MP-123456" />
+          </div>
+          <div class="field">
+            <label for="duration-B">Minutes</label>
+            <input id="duration-B" type="number" min="1" step="1" />
+          </div>
+        </div>
+
+        <div class="field" style="margin-top:8px;">
+          <label for="note-B">Note (optional)</label>
+          <input id="note-B" placeholder="Short label to help you recognise this case" />
+        </div>
+
+        <div class="timer-actions" style="margin-top:8px;">
+          <button id="btnLog-B" class="primary">Log</button>
+          <span id="timerMsg-B" class="small"></span>
+        </div>
+      </div>
+
+      <!-- Panel C -->
+      <div id="timerPanelC" class="timer-card hidden">
+        <div class="timer-head">
+          <div class="timer-title">Check 3</div>
+          <div class="timer-row">
+            <span id="timerDisplay-C" class="timer">00:00:00</span>
+            <div class="timer-actions">
+              <button id="btnStart-C">Start</button>
+              <button id="btnPause-C" disabled>Pause</button>
+              <button id="btnEnd-C" disabled>End</button>
+              <button id="btnReset-C">Reset timer</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="timer-grid">
+          <div class="field">
+            <label for="checkType-C">Check Type</label>
+            <select id="checkType-C"></select>
+          </div>
+          <div class="field">
+            <label for="caseId-C">Scorecard UID</label>
+            <input id="caseId-C" placeholder="e.g. MP-123456" />
+          </div>
+          <div class="field">
+            <label for="duration-C">Minutes</label>
+            <input id="duration-C" type="number" min="1" step="1" />
+          </div>
+        </div>
+
+        <div class="field" style="margin-top:8px;">
+          <label for="note-C">Note (optional)</label>
+          <input id="note-C" placeholder="Short label to help you recognise this case" />
+        </div>
+
+        <div class="timer-actions" style="margin-top:8px;">
+          <button id="btnLog-C" class="primary">Log</button>
+          <span id="timerMsg-C" class="small"></span>
+        </div>
+      </div>
+
+      <!-- Panel D -->
+      <div id="timerPanelD" class="timer-card hidden">
+        <div class="timer-head">
+          <div class="timer-title">Check 4</div>
+          <div class="timer-row">
+            <span id="timerDisplay-D" class="timer">00:00:00</span>
+            <div class="timer-actions">
+              <button id="btnStart-D">Start</button>
+              <button id="btnPause-D" disabled>Pause</button>
+              <button id="btnEnd-D" disabled>End</button>
+              <button id="btnReset-D">Reset timer</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="timer-grid">
+          <div class="field">
+            <label for="checkType-D">Check Type</label>
+            <select id="checkType-D"></select>
+          </div>
+          <div class="field">
+            <label for="caseId-D">Scorecard UID</label>
+            <input id="caseId-D" placeholder="e.g. MP-123456" />
+          </div>
+          <div class="field">
+            <label for="duration-D">Minutes</label>
+            <input id="duration-D" type="number" min="1" step="1" />
+          </div>
+        </div>
+
+        <div class="field" style="margin-top:8px;">
+          <label for="note-D">Note (optional)</label>
+          <input id="note-D" placeholder="Short label to help you recognise this case" />
+        </div>
+
+        <div class="timer-actions" style="margin-top:8px;">
+          <button id="btnLog-D" class="primary">Log</button>
+          <span id="timerMsg-D" class="small"></span>
+        </div>
+      </div>
     </div>
 
+    <!-- Calendar Sync + Quick Glance -->
     <div class="card">
       <div class="row" style="gap:16px; align-items:flex-start;">
         <div style="flex:1;">
           <b>Calendar → MASTER</b>
-          <div class="small" style="margin:6px 0 8px;">Imports <b>Accepted</b> events with titles matching your <b>Config</b>.</div>
+          <div class="small" style="margin:6px 0 8px;">Imports <b>Accepted</b> calendar events</div>
           <div class="row"><button id="btnSyncToday">Sync My Calendar (Today)</button></div>
           <div id="calMsg" class="small"></div>
         </div>
         <div style="flex:1;">
           <b>Today (Quick Glance)</b>
-          <div id="sumBox" class="small">Loading…</div>
+          <div id="sumBox" class="small" style="margin:6px 0 8px;">Loading…</div>
           <div class="row" style="margin-top:6px;">
             <button id="btnRefresh">Refresh</button>
           </div>
         </div>
       </div>
     </div>
-
   </div>
 
-  <!-- ===== Exception Modal (analyst → TL notification) ===== -->
-  <div id="exceptionBackdrop" class="modal-backdrop"></div>
-  <div id="exceptionModal" class="modal" aria-hidden="true">
-    <div class="modal-content">
-      <h3>Report Exception</h3>
-      <div class="small" id="excInfo" style="margin-bottom:6px;"></div>
+  <!-- ======= INSIGHTS OVERLAY (drawer + backdrop + toggle) ======= -->
+  <button class="insights-toggle" id="btnInsights">☰ Insights</button>
 
-      <label for="excDate">Date</label>
-      <input type="date" id="excDate" />
+  <div id="insightsBackdrop" class="insights-backdrop" aria-hidden="true"></div>
 
-      <div class="row" style="gap:8px">
-        <div style="flex:1">
-          <label for="excStart">Start time</label>
-          <input type="time" id="excStart" />
+  <aside id="insightsDrawer" class="insights-drawer" aria-hidden="true" aria-label="Analyst Insights">
+    <div class="insights-head">
+      <div class="insights-title">Analyst Insights</div>
+      <button id="insightsClose" class="insights-close" title="Close">× Close</button>
+    </div>
+    <div class="insights-tabs">
+      <button class="insights-tab active" data-tab="calendar">Calendar</button>
+      <button class="insights-tab" data-tab="stats">Stats</button>
+    </div>
+    <div class="insights-body">
+      <!-- Calendar tab -->
+      <div id="panel-calendar" class="insights-panel active">
+        <div class="row" id="calSearchBar" style="gap:8px; align-items:center; margin-bottom:8px;">
+          <label class="small" for="insCalDate">Date</label>
+          <input type="date" id="insCalDate" />
+          <button id="insCalGo" class="xbtn">Go</button>
+          <button id="insCalToday" class="xbtn">Yesterday</button>
         </div>
-        <div style="flex:1">
-          <label for="excEnd">End time</label>
-          <input type="time" id="excEnd" />
-        </div>
+        <div id="agentCalBox" class="small">Loading…</div>
       </div>
 
-      <label for="excCategory">Category</label>
-      <select id="excCategory">
-        <option value="">— Select —</option>
-        <option>System Outage</option>
-        <option>Appointment</option>
-        <option>Training</option>
-        <option>Connectivity</option>
-        <option>Other</option>
-      </select>
+      <!-- Stats tab (RANGE) -->
+      <div id="panel-stats" class="insights-panel">
+        <div class="row" id="statsSearchBar" style="gap:8px; align-items:center; margin-bottom:8px;">
+          <label class="small" for="insStatsStart">From</label>
+          <input type="date" id="insStatsStart" />
+          <label class="small" for="insStatsEnd">To</label>
+          <input type="date" id="insStatsEnd" />
+          <button id="insStatsGo" class="xbtn">Go</button>
+          <button id="insStatsWeek" class="xbtn">Week</button>
+          <button id="insStatsMonth" class="xbtn">Month</button>
+          <span id="insStatsMsg" class="small"></span>
+        </div>
+        <div id="agentStatsBox" class="small">Loading…</div>
+      </div>
+    </div>
+  </aside>
 
-      <label for="excReason">Details</label>
-      <textarea id="excReason" placeholder="Add any useful context for your Team Lead…"></textarea>
+  <!-- Exception Modal -->
+  <div id="exceptionBackdrop" class="modal-backdrop"></div>
+  <div id="exceptionModal" class="modal" aria-hidden="true">
+    <div class="panel">
+      <header>
+        <div>Report Exception</div>
+        <button id="excCancel" class="xbtn">✕</button>
+      </header>
+      <div class="body">
+        <div class="small" id="excInfo" style="margin-bottom:6px;"></div>
 
-      <div class="modal-actions">
-        <span class="small" id="excMsg" style="margin-right:auto"></span>
-        <button id="excCancel" class="xbtn">Cancel</button>
-        <button id="excSubmit" class="primary">Send</button>
+        <div class="field">
+          <label for="excDate">Date</label>
+          <input type="date" id="excDate" />
+        </div>
+
+        <div class="row" style="gap:8px; width:100%;">
+          <div class="field" style="flex:1">
+            <label for="excStart">Start time</label>
+            <input type="time" id="excStart" />
+          </div>
+          <div class="field" style="flex:1">
+            <label for="excEnd">End time</label>
+            <input type="time" id="excEnd" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="excCategory">Category</label>
+          <select id="excCategory">
+            <option value="">— Select —</option>
+            <option>System Outage</option>
+            <option>Appointment</option>
+            <option>Training</option>
+            <option>Connectivity</option>
+            <option>Other</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="excReason">Details</label>
+          <textarea id="excReason" placeholder="Add any useful context for your Team Lead…" style="min-height:90px; resize:vertical;"></textarea>
+        </div>
+
+        <div class="row" style="justify-content:space-between;">
+          <span id="excMsg" class="small"></span>
+          <button id="excSubmit" class="primary">Send</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Profile Modal -->
+  <div id="profBackdrop" class="modal-backdrop"></div>
+  <div id="profModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="profTitle">
+    <div class="panel">
+      <header>
+        <div id="profTitle">My Profile</div>
+        <button id="profCancel" class="xbtn">✕</button>
+      </header>
+      <div class="body">
+        <div id="profStatus" class="small muted"></div>
+        <div class="field">
+          <label for="profName">Preferred name</label>
+          <input id="profName" type="text" placeholder="Your display name">
+        </div>
+        <div class="field">
+          <label for="profTeam">Team</label>
+          <input id="profTeam" type="text" placeholder="e.g. Squad A">
+        </div>
+        <div class="field">
+          <label for="profHours">Contracted hours per week</label>
+          <input id="profHours" type="number" min="0" step="0.25" placeholder="e.g. 37.5">
+        </div>
+      </div>
+      <div class="actions">
+        <button id="profSave" class="primary">Save</button>
       </div>
     </div>
   </div>
 
   <!-- Inject logic via Apps Script templating -->
+  <?!= include('insights.widget'); ?>
   <?!= include('FlowLogic'); ?>
 </body>
 </html>
