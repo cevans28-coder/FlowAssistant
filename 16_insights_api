@@ -1,0 +1,716 @@
+/******************************************************
+ * 16_insights_api.gs — shared endpoints for Insights
+ *
+ * Exposes:
+ * - getAnalystInsights(startISO, endISO) // states + checks + calendar + exceptions + plans
+ * - getAnalystStats(dateISO) // single day (rolled up; today/future => dashes)
+ * - getAnalystStatsRange(startISO, endISO) // multi-day rolled-up stats
+ * - getMyWorkPlan(dateISO) // editable daily plan (start/end/lunch/location)
+ * - saveMyWorkPlan(payload) // upsert plan
+ *
+ * Design:
+ * • No live KPI maths. We PREFER cached/rolled sheets:
+ * - STATE_SEGMENTS_V1 (per-segment rows)
+ * - CALENDAR_TOTALS_V1 (per-event rows; keep title "(Private)" as "Private")
+ * - ANALYST_DAILY (one row per analyst/day; precomputed kpis)
+ * • If a cache sheet is missing or empty for a day, we soft-fallback to source
+ * sheets (STATUS_LOGS, CHECK_EVENTS, CalendarApp) so the UI doesn’t break.
+ * • Exceptions are read from EXCEPTIONS (only “applied” ones are shown).
+ ******************************************************/
+
+// ---------- tiny, safe helpers (LOCAL) ----------
+function toISODate_(d) {
+  var tz = Session.getScriptTimeZone();
+  return Utilities.formatDate(d instanceof Date ? d : new Date(), tz, 'yyyy-MM-dd');
+}
+function isoDay_(d) { return toISODate_(d); }
+function endOfDay_(iso) { return new Date(iso + 'T23:59:59'); }
+function startOfDay_(iso) { return new Date(iso + 'T00:00:00'); }
+function isValidISODate_(x){ return /^\d{4}-\d{2}-\d{2}$/.test(String(x||'')); }
+
+function normSafe_(x) {
+  try { return (typeof normId_ === 'function') ? normId_(x) : String(x||'').trim().toLowerCase(); }
+  catch(_) { return String(x||'').trim().toLowerCase(); }
+}
+function getCurrentAnalystIdNorm_(){
+  var raw = (typeof getCurrentAnalystId_ === 'function') ? getCurrentAnalystId_() : '';
+  return normSafe_(raw);
+}
+
+// ---------- common accessors ----------
+function ss_(){ return master_(); }
+
+// Read a whole sheet as objects (resilient to empty/headers)
+function readRows_(sh){
+  if (!sh) return [];
+  var v = sh.getDataRange().getValues();
+  if (!v || v.length <= 1) return [];
+  var hdr = (v[0]||[]).map(function(h){ return String(h||'').trim(); });
+  var out = [];
+  for (var i=1; i<v.length; i++){
+    var row = v[i], o = {};
+    for (var j=0; j<hdr.length; j++){ o[hdr[j]] = row[j]; }
+    out.push(o);
+  }
+  return out;
+}
+
+// ---------- WORK PLANS (sheet: WorkingLocationsV2 expected) ----------
+/** Map { dateISO: {location,start_hm,end_hm,lunch_minutes,planned_mins} } */
+function _getMyWorkPlans_(startISO, endISO){
+  var out = {};
+  var me = getCurrentAnalystIdNorm_();
+  var sh = getWorkingLocationsV2Sheet_ && getWorkingLocationsV2Sheet_();
+  if (!sh || sh.getLastRow() <= 1) return out;
+
+  function hmToM(hm){
+    var m = String(hm||'').match(/^(\d{1,2}):(\d{2})$/);
+    return m ? (Number(m[1])*60 + Number(m[2])) : null;
+  }
+
+  readRows_(sh)
+    .filter(function(r){
+      var idn = r.analyst_id_norm || (r.analyst_id ? normSafe_(r.analyst_id) : null);
+      var d = r.date_str || r.date_iso || (r.date instanceof Date ? isoDay_(r.date) : null);
+      return idn === me && d && d >= startISO && d <= endISO;
+    })
+    .forEach(function(r){
+      var date = r.date_str || r.date_iso || isoDay_(r.date);
+      var plan = {
+        location: r.location || '',
+        start_hm: r.start_hm || r.source || '',
+        end_hm: r.end_hm || r.note || '',
+        lunch_minutes: Number(r.lunch_minutes || 60) || 60
+      };
+      var sM = hmToM(plan.start_hm), eM = hmToM(plan.end_hm);
+      var planned = (sM!=null && eM!=null && eM > sM)
+        ? Math.max(0, (eM - sM) - Math.max(0, plan.lunch_minutes))
+        : Math.round(7.5*60);
+      plan.planned_mins = planned;
+      out[date] = plan;
+    });
+
+  return out;
+}
+
+// User-facing helpers for plans
+function getMyWorkPlan(dateISO){
+  var day = isValidISODate_(dateISO) ? dateISO : toISODate_(new Date());
+  var map = _getMyWorkPlans_(day, day); // uses your sheet
+  var p = map[day] || null;
+  return {
+    ok: true,
+    dateISO: day,
+    plan: p ? {
+      dateISO: day,
+      start_hm: p.start_hm || '',
+      end_hm: p.end_hm || '',
+      lunch_minutes: Number(p.lunch_minutes||0) || 0,
+      location: p.location || '',
+      planned_mins: Number(p.planned_mins||0) || 0
+    } : null
+  };
+}
+function saveMyWorkPlan(payload){
+  if (!payload) return { ok:false, error: 'No payload' };
+  var day = isValidISODate_(payload.dateISO) ? payload.dateISO : toISODate_(new Date());
+  var me = getCurrentAnalystIdNorm_();
+  var sh = getWorkingLocationsV2Sheet_ && getWorkingLocationsV2Sheet_();
+  if (!sh) return { ok:false, error: 'Working Locations sheet not found' };
+
+  var data = sh.getDataRange().getValues();
+  if (data.length < 2) {
+    // header only — append
+    sh.appendRow([
+      new Date(day + 'T00:00:00'), // Date col
+      me, // analyst_id_norm
+      payload.location || '',
+      payload.start_hm || '',
+      payload.end_hm || '',
+      Number(payload.lunch_minutes||0) || 0
+    ]);
+  } else {
+    var tz = Session.getScriptTimeZone();
+    var hdr = data[0];
+    var colMap = (function(){
+      var m = {};
+      for (var i=0;i<hdr.length;i++){
+        var key = String(hdr[i]||'').toLowerCase();
+        if (key.includes('date')) m.date = i;
+        else if (key.includes('analyst') && key.includes('norm')) m.analyst = i;
+        else if (key.includes('location')) m.location = i;
+        else if (key.includes('start')) m.start_hm = i;
+        else if (key.includes('end')) m.end_hm = i;
+        else if (key.includes('lunch')) m.lunch = i;
+      }
+      if (m.date == null) m.date = 0;
+      if (m.analyst == null) m.analyst = 1;
+      if (m.location == null) m.location = 2;
+      if (m.start_hm == null) m.start_hm = 3;
+      if (m.end_hm == null) m.end_hm = 4;
+      if (m.lunch == null) m.lunch = 5;
+      return m;
+    })();
+
+    var foundRow = -1;
+    for (var r=1; r<data.length; r++){
+      var row = data[r];
+      var rowDate = row[colMap.date] instanceof Date
+        ? Utilities.formatDate(row[colMap.date], tz, 'yyyy-MM-dd')
+        : String(row[colMap.date]||'');
+      var rowAnalyst = normSafe_(row[colMap.analyst]);
+      if (rowAnalyst === me && rowDate === day){
+        foundRow = r+1; break;
+      }
+    }
+
+    if (foundRow > 0){
+      sh.getRange(foundRow, colMap.location+1).setValue(payload.location || '');
+      sh.getRange(foundRow, colMap.start_hm+1).setValue(payload.start_hm || '');
+      sh.getRange(foundRow, colMap.end_hm+1).setValue(payload.end_hm || '');
+      sh.getRange(foundRow, colMap.lunch+1).setValue(Number(payload.lunch_minutes||0) || 0);
+    } else {
+      sh.appendRow([
+        new Date(day + 'T00:00:00'),
+        me,
+        payload.location || '',
+        payload.start_hm || '',
+        payload.end_hm || '',
+        Number(payload.lunch_minutes||0) || 0
+      ]);
+    }
+  }
+
+  return getMyWorkPlan(day);
+}
+
+// ---------- CACHE READERS (PREFER these over live) ----------
+
+// STATE_SEGMENTS_V1: expected columns include (flexible order):
+// date, analyst_id_norm, start_iso, end_iso, state, minutes
+function readStateSegmentsFromCache_(startISO, endISO){
+  var ss = ss_();
+  var sh = ss.getSheetByName('STATE_SEGMENTS_V1');
+  if (!sh || sh.getLastRow() <= 1) return null; // no cache
+  var me = getCurrentAnalystIdNorm_();
+  var from = startISO, to = endISO;
+  var rows = readRows_(sh).filter(function(r){
+    var d = r.date || r.date_iso || r.day || '';
+    var idn = r.analyst_id_norm || (r.analyst_id ? normSafe_(r.analyst_id) : null);
+    return d && d >= from && d <= to && idn === me;
+  }).map(function(r){
+    return {
+      date: String(r.date || r.date_iso || r.day),
+      start_iso: String(r.start_iso || r.start_ts || ''),
+      end_iso: String(r.end_iso || r.end_ts || ''),
+      state: String(r.state || 'Idle'),
+      minutes: Math.max(0, Number(r.minutes||0) || 0)
+    };
+  });
+  return rows;
+}
+
+// CALENDAR_TOTALS_V1: we will treat it as per-event cache (preferred).
+// Expected columns (flexible): date, analyst_id_norm, start_iso, end_iso, minutes, title, private
+function readCalendarEventsFromCache_(startISO, endISO){
+  var ss = ss_();
+  var sh = ss.getSheetByName('CALENDAR_TOTALS_V1');
+  if (!sh || sh.getLastRow() <= 1) return null;
+  var me = getCurrentAnalystIdNorm_();
+  var rows = readRows_(sh).filter(function(r){
+    var d = r.date || r.date_iso || r.day || '';
+    var idn = r.analyst_id_norm || (r.analyst_id ? normSafe_(r.analyst_id) : null);
+    return d && d >= startISO && d <= endISO && idn === me;
+  }).map(function(r){
+    var title = String(r.title || '');
+    if (title === '(Private)' || String(r.private||'').toLowerCase()==='true') title = 'Private';
+    var s = r.start_iso || r.start_ts || '';
+    var e = r.end_iso || r.end_ts || '';
+    var m = Math.max(0, Number(r.minutes||0) || 0);
+    // If a row is a DAILY TOTAL (no start/end), we skip here (widget wants per-event blocks).
+    if (!s || !e) return null;
+    return {
+      date: String(r.date || r.date_iso || r.day),
+      title: title || 'Accepted meeting',
+      start_iso: String(s),
+      end_iso: String(e),
+      minutes: m
+    };
+  }).filter(Boolean);
+  return rows;
+}
+
+// ANALYST_DAILY: one row per analyst/day; expected flexible columns such as:
+// date, analyst_id_norm, checks_today, check_minutes_total, working_mins, admin_mins,
+// utilisation_pct, adherence_pct, tph, meeting_mins, planned_window_mins, etc.
+function readAnalystDailyRows_(startISO, endISO){
+  var ss = ss_();
+  var sh = ss.getSheetByName('ANALYST_DAILY');
+  if (!sh || sh.getLastRow() <= 1) return [];
+  var me = getCurrentAnalystIdNorm_();
+  return readRows_(sh).filter(function(r){
+    var d = r.date || r.date_iso || r.day || '';
+    var idn = r.analyst_id_norm || (r.analyst_id ? normSafe_(r.analyst_id) : null);
+    return d && d >= startISO && d <= endISO && idn === me;
+  }).map(function(r){
+    function num(x){ return Number(x||0) || 0; }
+    function capPct(x){ var n = Number(x); return (isFinite(n) ? Math.max(0, Math.min(100, n)) : null); }
+    return {
+      date: String(r.date || r.date_iso || r.day),
+      checks_today: num(r.checks_today),
+      check_minutes_total: num(r.check_minutes_total),
+      expected_minutes: num(r.expected_minutes),
+      pace_pct: (r.pace_pct==null||r.pace_pct==='') ? null : num(r.pace_pct),
+      utilisation_pct: (r.utilisation_pct==null||r.utilisation_pct==='') ? null : capPct(r.utilisation_pct),
+      adherence_pct: (r.adherence_pct==null||r.adherence_pct==='') ? null : capPct(r.adherence_pct),
+      tph: num(r.tph),
+      working_mins: num(r.working_mins),
+      admin_mins: num(r.admin_mins),
+      meeting_mins: num(r.meeting_mins),
+      planned_window_mins: num(r.planned_window_mins),
+      live_window_mins: num(r.live_window_mins),
+      elapsed_planned_mins: num(r.elapsed_planned_mins),
+      has_valid_plan: String(r.has_valid_plan || '').toLowerCase() === 'true'
+    };
+  });
+}
+
+// ---------- FALLBACK BUILDERS (only used if cache missing) ----------
+
+// Legacy: recompute state segments from STATUS_LOGS
+function _recomputeStateSegments_(startISO, endISO){
+  var ss = ss_();
+  var sh = ss.getSheetByName(SHEETS && SHEETS.STATUS_LOGS || 'STATUS_LOGS');
+  if (!sh || sh.getLastRow() <= 1) return [];
+  var me = getCurrentAnalystIdNorm_();
+  var from = startOfDay_(startISO);
+  var to = endOfDay_(endISO);
+
+  var all = readRows_(sh)
+    .map(function(r){
+      var rawTs = r.ts || r.ts_iso || r.timestamp_iso || r.timestamp;
+      var ts = rawTs instanceof Date ? rawTs : (rawTs ? new Date(rawTs) : null);
+      if (!ts || isNaN(ts)) return null;
+      var idNorm = r.analyst_id_norm || (r.analyst_id ? normSafe_(r.analyst_id) : null);
+      var state = String(r.state || '').trim() || 'Idle';
+      return { ts: ts, id: idNorm, state: state };
+    })
+    .filter(Boolean)
+    .filter(function(x){ return x.id === me && x.ts <= to; })
+    .sort(function(a,b){ return a.ts - b.ts; });
+
+  if (!all.length) return [];
+
+  // seed: last state before window
+  var seed = null;
+  for (var i = all.length - 1; i >= 0; i--) {
+    if (all[i].ts < from) { seed = all[i]; break; }
+  }
+
+  var segs = [];
+  var curState = seed ? seed.state : null;
+  var curStart = seed ? from : null;
+
+  function pushClippedByDay_(startTs, endTs, state) {
+    if (!startTs || !endTs || endTs <= startTs) return;
+    var s = new Date(Math.max(startTs.getTime(), from.getTime()));
+    var e = new Date(Math.min(endTs.getTime(), to.getTime()));
+    if (e <= s) return;
+
+    var cursor = new Date(s);
+    while (cursor < e) {
+      var dayISO = isoDay_(cursor);
+      var dayEnd = endOfDay_(dayISO);
+      var segEnd = new Date(Math.min(dayEnd.getTime(), e.getTime()));
+      var minutes = Math.round((segEnd - cursor)/60000);
+      if (minutes > 0) {
+        segs.push({
+          date: dayISO,
+          start_iso: cursor.toISOString(),
+          end_iso: segEnd.toISOString(),
+          state: String(state || 'Idle'),
+          minutes: minutes
+        });
+      }
+      cursor = new Date(dayEnd.getTime() + 1000);
+    }
+  }
+
+  for (var j = 0; j < all.length; j++) {
+    var ev = all[j];
+    if (ev.ts < from) continue;
+    if (ev.ts > to) break;
+    if (curState !== null && curStart !== null) pushClippedByDay_(curStart, ev.ts, curState);
+    curState = ev.state || 'Idle';
+    curStart = ev.ts;
+  }
+  if (curState !== null && curStart !== null) pushClippedByDay_(curStart, to, curState);
+
+  return segs;
+}
+
+// Legacy: checks per range from CHECK_EVENTS
+function _getMyChecksInRange_(startISO, endISO){
+  var ss = ss_();
+  var sh = ss.getSheetByName(SHEETS && SHEETS.CHECK_EVENTS || 'CHECK_EVENTS');
+  if (!sh || sh.getLastRow() <= 1) return [];
+  var me = getCurrentAnalystIdNorm_();
+  var from = startOfDay_(startISO);
+  var to = endOfDay_(endISO);
+
+  return readRows_(sh)
+    .map(function(r){
+      var ts = r.ts instanceof Date ? r.ts : (r.ts ? new Date(r.ts) : null);
+      var idn = r.analyst_id_norm || (r.analyst_id ? normSafe_(r.analyst_id) : null);
+      if (!ts || isNaN(ts)) return null;
+      return {
+        idn: idn,
+        ts: ts,
+        minutes: Number(r.minutes || r.duration || r.duration_mins || 0) || 0,
+        check_type: r.check_type || '',
+        case_id: r.case_id || r.scorecard_uid || ''
+      };
+    })
+    .filter(Boolean)
+    .filter(function(x){ return x.idn === me && x.ts >= from && x.ts <= to; })
+    .map(function(x){
+      return {
+        date: isoDay_(x.ts),
+        ts_iso: x.ts.toISOString(),
+        minutes: Math.max(0, Math.round(x.minutes)),
+        check_type: x.check_type,
+        case_id: x.case_id
+      };
+    });
+}
+
+// Legacy: accepted calendar events (per-event)
+function _getMyAcceptedCalendar_(startISO, endISO){
+  var out = [];
+  var from = new Date(startISO + 'T00:00:00');
+  var to = new Date(endISO + 'T23:59:59');
+
+  try {
+    var cal = CalendarApp.getDefaultCalendar();
+    var evs = cal.getEvents(from, to);
+    for (var i=0;i<evs.length;i++){
+      var e = evs[i];
+
+      // Only keep events the user has Accepted or owns
+      var my = e.getMyStatus && e.getMyStatus();
+      if (my && my !== CalendarApp.GuestStatus.YES && my !== CalendarApp.GuestStatus.OWNER) continue;
+
+      var s = e.getStartTime(), en = e.getEndTime();
+      if (!s || !en || en <= s) continue;
+
+      var mins = Math.round((en - s)/60000);
+      var title = e.isPrivate && e.isPrivate() ? 'Private' : (e.getTitle() || 'Accepted meeting');
+      // Some domains return "(Private)" literal
+      if (title === '(Private)') title = 'Private';
+
+      out.push({
+        date: Utilities.formatDate(s, Session.getScriptTimeZone(), 'yyyy-MM-dd'),
+        title: title,
+        start_iso: s.toISOString(),
+        end_iso: en.toISOString(),
+        minutes: Math.max(0, mins)
+      });
+    }
+    out.sort(function(a,b){ return new Date(a.start_iso) - new Date(b.start_iso); });
+    return out;
+  } catch (err){
+    // If CalendarApp restricted, just return [] — widget will show “no events”.
+    return out;
+  }
+}
+
+// Exceptions (applied) from EXCEPTIONS sheet
+function _getMyExceptionsInRange_(startISO, endISO){
+  var ss = ss_();
+  var sh = ss.getSheetByName('EXCEPTIONS');
+  if (!sh || sh.getLastRow() <= 1) return [];
+  var me = getCurrentAnalystIdNorm_();
+
+  return readRows_(sh).map(function(r){
+    var id1 = r.analyst_id_norm || (r.analyst_id ? normSafe_(r.analyst_id) : null);
+    if (id1 !== me) return null;
+
+    var d = r.date_iso || r.data_iso || '';
+    if (!d || d < startISO || d > endISO) return null;
+
+    var s = r.start_ts || r.start_iso || '';
+    var e = r.end_ts || r.end_iso || '';
+    var m = Number(r.minutes||0) || 0;
+    var cat = r.category || 'Exception';
+
+    // “Applied” filter — either applied_ts_utc exists OR status == applied-ish
+    var status = String(r.status||'').toLowerCase();
+    var isApplied = !!(r.applied_ts_utc) || (status === 'applied' || status === 'complete' || status === 'done');
+    if (!isApplied) return null;
+
+    // Normalize ISO if stored as Date
+    if (s instanceof Date) s = s.toISOString();
+    if (e instanceof Date) e = e.toISOString();
+
+    // Ensure minutes if missing
+    if ((!m || m<=0) && s && e){
+      try { m = Math.max(0, Math.round((new Date(e) - new Date(s))/60000)); } catch(e2){}
+    }
+
+    return {
+      date: d,
+      start_iso: s || (d ? (d+'T00:00:00') : ''),
+      end_iso: e || (d ? (d+'T00:10:00') : ''),
+      minutes: m,
+      category: cat
+    };
+  }).filter(Boolean);
+}
+
+// ---------- MASTER: calendar + states ----------
+function getAnalystInsights(startISO, endISO) {
+  var today = toISODate_(new Date());
+  startISO = isValidISODate_(startISO) ? startISO : today;
+  endISO = isValidISODate_(endISO) ? endISO : startISO;
+
+  // Prefer caches
+  var state_segments = readStateSegmentsFromCache_(startISO, endISO);
+  if (!state_segments) state_segments = _recomputeStateSegments_(startISO, endISO);
+
+  var calendar = readCalendarEventsFromCache_(startISO, endISO);
+  if (!calendar) calendar = _getMyAcceptedCalendar_(startISO, endISO);
+
+  var checks = _getMyChecksInRange_(startISO, endISO); // checks are cheap to read raw
+  var work_plans = _getMyWorkPlans_(startISO, endISO);
+  var exceptions = _getMyExceptionsInRange_(startISO, endISO);
+
+  return {
+    ok: true,
+    range: { startISO: startISO, endISO: endISO },
+    state_segments: state_segments || [],
+    checks: checks || [],
+    calendar: calendar || [],
+    exceptions: exceptions || [],
+    work_plans: work_plans || {}
+  };
+}
+
+// ---------- KPIs: ROLLED ONLY (no live) ----------
+
+// Single day (used if UI asks a single date)
+function getAnalystStats(dateISO) {
+  var day = isValidISODate_(dateISO) ? dateISO : toISODate_(new Date());
+  // Today or future => show blanks
+  var today = toISODate_(new Date());
+  if (day >= today){
+    return {
+      ok: true,
+      date: day,
+      kpis: {
+        checks_today: 0,
+        check_minutes_total: 0,
+        expected_minutes: 0,
+        pace_pct: null,
+        utilisation_pct: null,
+        adherence_pct: null,
+        tph: 0,
+        working_mins: 0,
+        admin_mins: 0,
+        meeting_mins: 0,
+        planned_window_mins: 0,
+        live_window_mins: 0,
+        elapsed_planned_mins: 0,
+        has_valid_plan: false
+      },
+      live: { state: 'Idle', since_iso: null },
+      message: 'Stats for this date will be available the following day.'
+    };
+  }
+
+  var rows = readAnalystDailyRows_(day, day);
+  if (rows && rows.length){
+    return {
+      ok: true,
+      date: day,
+      kpis: rows[0],
+      live: { state: 'Idle', since_iso: null }
+    };
+  }
+
+  // No row present — return blanks (no live fallback per your decision)
+  return {
+    ok: true,
+    date: day,
+    kpis: {
+      checks_today: 0,
+      check_minutes_total: 0,
+      expected_minutes: 0,
+      pace_pct: null,
+      utilisation_pct: null,
+      adherence_pct: null,
+      tph: 0,
+      working_mins: 0,
+      admin_mins: 0,
+      meeting_mins: 0,
+      planned_window_mins: 0,
+      live_window_mins: 0,
+      elapsed_planned_mins: 0,
+      has_valid_plan: false
+    },
+    live: { state: 'Idle', since_iso: null },
+    message: 'No rolled stats found for this date.'
+  };
+}
+
+/**
+ * getAnalystDailyRange(startISO, endISO)
+ * Reads ANALYST_DAILY for the signed-in analyst, returning rows
+ * between startISO..endISO but NEVER later than "yesterday".
+ * The client aggregates these; this avoids any live/day-of math.
+ */
+function getAnalystDailyRange(startISO, endISO){
+  var tz = (typeof TZ === 'string' && TZ) || Session.getScriptTimeZone();
+  var idn = (typeof getCurrentAnalystId_ === 'function')
+              ? String(getCurrentAnalystId_()||'').trim().toLowerCase()
+              : Session.getActiveUser().getEmail().toLowerCase();
+
+  function iso(d){ return Utilities.formatDate(d, tz, 'yyyy-MM-dd'); }
+  function parseISO(s){ return new Date(s + 'T00:00:00'); }
+
+  var sISO = /^\d{4}-\d{2}-\d{2}$/.test(String(startISO||'')) ? startISO : iso(new Date());
+  var eISO = /^\d{4}-\d{2}-\d{2}$/.test(String(endISO||'')) ? endISO : sISO;
+
+  // move end cap to yesterday
+  var today = new Date(); var y = new Date(today); y.setDate(today.getDate()-1);
+  var eCapISO = iso(y);
+  if (eISO > eCapISO) eISO = eCapISO;
+
+  var ss = master_();
+  var tab = (SHEETS && SHEETS.ANALYST_DAILY) ? SHEETS.ANALYST_DAILY : 'ANALYST_DAILY';
+  var sh = ss.getSheetByName(tab);
+  if (!sh || sh.getLastRow() < 2){
+    return { ok:true, rows:[], startISO:sISO, endISO:eISO, skippedAfter:eCapISO };
+  }
+
+  var data = sh.getDataRange().getValues();
+  var hdr = data[0];
+  // Column indexes by header text
+  var idx = {};
+  hdr.forEach(function(h,i){ idx[String(h).toLowerCase()] = i; });
+  function col(name, fallback){ var i = idx[String(name).toLowerCase()]; return (i==null?fallback:i); }
+
+  var out = [];
+  for (var r=1;r<data.length;r++){
+    var row = data[r];
+    var dISO = row[col('date',0)];
+    if (dISO instanceof Date) dISO = Utilities.formatDate(dISO, tz, 'yyyy-MM-dd');
+    dISO = String(dISO||'').slice(0,10);
+
+    var who = String(row[col('analyst_id_norm',1)]||'').toLowerCase();
+    if (who !== idn) continue;
+    if (dISO < sISO || dISO > eISO) continue;
+
+    out.push({
+      date: dISO,
+      working_mins: Number(row[col('working_mins',2)]||0) || 0,
+      admin_mins: Number(row[col('admin_mins',3)]||0) || 0,
+      idle_mins: Number(row[col('idle_mins',4)]||0) || 0,
+      meeting_mins: Number(row[col('meeting_mins',5)]||0) || 0,
+      exception_mins: Number(row[col('exception_mins',6)]||0) || 0,
+      checks_count: Number(row[col('checks_count',7)]||0) || 0,
+      check_minutes: Number(row[col('check_minutes',8)]||0) || 0,
+      // plan fields (optional in UI)
+      plan_location: String(row[col('plan_location',9)]||''),
+      plan_start_hm: String(row[col('plan_start_hm',10)]||''),
+      plan_end_hm: String(row[col('plan_end_hm',11)]||''),
+      plan_lunch_mins: Number(row[col('plan_lunch_mins',12)]||0) || 0
+    });
+  }
+
+  return { ok:true, startISO:sISO, endISO:eISO, rows: out, skippedAfter: eCapISO };
+}
+
+
+// Range (week / month / custom). Returns an aggregate plus daily rows.
+function getAnalystStatsRange(startISO, endISO){
+  var today = toISODate_(new Date());
+  startISO = isValidISODate_(startISO) ? startISO : today;
+  endISO = isValidISODate_(endISO) ? endISO : startISO;
+
+  var rows = readAnalystDailyRows_(startISO, endISO) || [];
+
+  // If the range contains today/future days, we still include them as blanks (—)
+  // Build a date map to ensure continuity
+  var rowsByDate = {};
+  rows.forEach(function(r){ rowsByDate[r.date] = r; });
+
+  var cur = new Date(startISO + 'T00:00:00');
+  var end = new Date(endISO + 'T00:00:00');
+  var filled = [];
+  while (cur <= end){
+    var d = isoDay_(cur);
+    if (d >= today){
+      filled.push({
+        date: d,
+        checks_today: 0,
+        check_minutes_total: 0,
+        expected_minutes: 0,
+        pace_pct: null,
+        utilisation_pct: null,
+        adherence_pct: null,
+        tph: 0,
+        working_mins: 0,
+        admin_mins: 0,
+        meeting_mins: 0,
+        planned_window_mins: 0,
+        live_window_mins: 0,
+        elapsed_planned_mins: 0,
+        has_valid_plan: false,
+        message: 'Stats available the following day.'
+      });
+    } else if (rowsByDate[d]) {
+      filled.push(rowsByDate[d]);
+    } else {
+      filled.push({
+        date: d,
+        checks_today: 0,
+        check_minutes_total: 0,
+        expected_minutes: 0,
+        pace_pct: null,
+        utilisation_pct: null,
+        adherence_pct: null,
+        tph: 0,
+        working_mins: 0,
+        admin_mins: 0,
+        meeting_mins: 0,
+        planned_window_mins: 0,
+        live_window_mins: 0,
+        elapsed_planned_mins: 0,
+        has_valid_plan: false,
+        message: 'No rolled stats found for this date.'
+      });
+    }
+    cur.setDate(cur.getDate()+1);
+  }
+
+  // Aggregate totals over the past days in range that actually have numbers
+  function sum(k){ return filled.reduce(function(a,b){ return a + (Number(b[k]||0) || 0); }, 0); }
+  var agg = {
+    startISO: startISO,
+    endISO: endISO,
+    checks_total: sum('checks_today'),
+    check_minutes_total: sum('check_minutes_total'),
+    working_mins_total: sum('working_mins'),
+    admin_mins_total: sum('admin_mins'),
+    meeting_mins_total: sum('meeting_mins'),
+    planned_mins_total: sum('planned_window_mins'),
+    // Do NOT try to recompute utilisation/adherence over the range — those are daily KPIs.
+  };
+
+  return {
+    ok: true,
+    range: { startISO: startISO, endISO: endISO },
+    daily: filled,
+    aggregate: agg
+  };
+}
