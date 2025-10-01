@@ -63,19 +63,20 @@ function getDailyMetricsSheet_() {
 function computeDailyMetricsRow_(analystId, dateISO) {
   const ss = master_();
 
-  // 1) Baseline hours → minutes (fallback to analyst baseline or 8.5h)
+  // 1) Baseline
   const baselineHours =
     Number(getBaselineHoursForAnalyst_(analystId)) ||
     Number(getMyBaselineHours_ && getMyBaselineHours_()) || 8.5;
   const baselineMins = Math.max(0, Math.round(baselineHours * 60));
 
-  // 2) Meetings (accepted) for the date → minutes
+  // 2) Meetings + OOO minutes
   const meetingMins = Math.max(0, Number(getAcceptedMeetingMinutes_(analystId, dateISO) || 0));
+  const oooMins = Math.max(0, Number(getOOOMinutesForDay_(analystId, dateISO) || 0));
 
-  // 3) Available minutes = baseline − meetings (>=0)
-  const availableMins = Math.max(0, baselineMins - meetingMins);
+  // 3) Available minutes = baseline − meetings − OOO
+  const availableMins = Math.max(0, baselineMins - meetingMins - oooMins);
 
-  // 4) CheckEvents → handling + counts by type (single pass)
+  // 4) CheckEvents → handling + counts by type
   const ce = ss.getSheetByName(SHEETS.CHECK_EVENTS);
   let handlingMins = 0;
   let outputTotal = 0;
@@ -99,8 +100,8 @@ function computeDailyMetricsRow_(analystId, dateISO) {
     }
   }
 
-  // 5) Standard mins = Σ (count_by_type × avg_minutes from CheckTypes)
-  const types = readCheckTypes_(); // [{name, avg_minutes}]
+  // 5) Standard mins
+  const types = readCheckTypes_();
   const avgMap = {};
   (types || []).forEach(t => (avgMap[String(t.name)] = Number(t.avg_minutes || 0)));
   let standardMins = 0;
@@ -108,13 +109,13 @@ function computeDailyMetricsRow_(analystId, dateISO) {
     standardMins += (perTypeCount[ct] || 0) * (avgMap[ct] || 0);
   });
 
-  // 6) KPIs (guard divisions; utilisation capped at 100 for DailyMetrics)
+  // 6) KPIs
   const efficiencyPct = (handlingMins > 0 && standardMins > 0)
     ? Math.round((handlingMins / standardMins) * 100)
     : 0;
 
   const utilisationRaw = availableMins > 0 ? (handlingMins / availableMins) * 100 : 0;
-  const utilisationPct = Math.min(100, Math.round(utilisationRaw)); // agreed cap
+  const utilisationPct = Math.min(100, Math.round(utilisationRaw));
 
   const throughputPerHr = (availableMins > 0)
     ? Number((outputTotal / (availableMins / 60)).toFixed(2))
@@ -133,6 +134,7 @@ function computeDailyMetricsRow_(analystId, dateISO) {
     flags: '',
     notes: '',
     meeting_mins: Math.max(0, Math.round(meetingMins))
+    // (We’re not adding an ooo_mins column to DailyMetrics; it’s baked into available_mins.)
   };
 }
 
@@ -170,7 +172,7 @@ function buildMyMetricsToday() {
 
 /** Build metrics for *me* for an explicit date (UI button with token) + rollup. */
 function buildMyMetricsForDate(token, dateISO) {
-  requireSession_(token);
+  token = requireSessionOrAdopt_(token);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dateISO || ''))) throw new Error('Use YYYY-MM-DD');
   const analystId = getCurrentAnalystId_();
   const row = computeDailyMetricsRow_(analystId, dateISO);
@@ -240,11 +242,11 @@ function computeLiveProductionToday_(analystId) {
   const id = normId_(analystId);
   const dateISO = toISODate_(new Date());
 
-  // Baseline & meetings → available
   const baselineHours = _faSafeNum(getBaselineHoursForAnalyst_(id) || 8.5);
   const baselineMins = _faClamp0(Math.round(baselineHours * 60));
   const meetingMins = _faClamp0(getAcceptedMeetingMinutes_(id, dateISO));
-  const availableMins = _faClamp0(baselineMins - meetingMins);
+  const oooMins = _faClamp0(getOOOMinutesForDay_(id, dateISO)); // <- NEW
+  const availableMins = _faClamp0(baselineMins - meetingMins - oooMins);
 
   // Logged-in minutes today (everything except LoggedOut/OOO), cap open stint at now
   const sl = readRows_(ss.getSheetByName(SHEETS.STATUS_LOGS))
