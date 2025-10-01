@@ -1,0 +1,137 @@
+/******************************************************
+ * 06_work_plan_v2.gs — WorkLocations v2 (read/write)
+ * Depends on:
+ * - SHEETS, TZ (00_constants.gs)
+ * - master_(), getOrCreateMasterSheet_() (02_master_access.gs)
+ * - normId_, toISODate_, readRows_ (01_utils.gs)
+ * - getCurrentAnalystId_() (03_sessions.gs)
+ * - upsertLive_() (04_state_engine.gs)
+ ******************************************************/
+
+/** Canonical headers for WorkLocations_v2. */
+var __WORK_LOC_V2_HEADERS__ = [
+  'timestamp_iso', 'date', 'analyst_id',
+  'location', 'start_hm', 'end_hm', 'lunch_minutes',
+  'source', 'note'
+];
+
+/** Get/create the WorkLocations_v2 sheet with correct headers. */
+function getWorkingLocationsV2Sheet_() {
+  var tab = (SHEETS && SHEETS.WORK_LOC_V2) ? SHEETS.WORK_LOC_V2 : 'WorkLocations_v2';
+  var sh = getOrCreateMasterSheet_(tab, __WORK_LOC_V2_HEADERS__);
+  // align headers if sheet exists but first row differs
+  var cur = sh.getRange(1, 1, 1, Math.max(__WORK_LOC_V2_HEADERS__.length, sh.getLastColumn()))
+              .getValues()[0].map(String);
+  for (var i = 0; i < __WORK_LOC_V2_HEADERS__.length; i++) {
+    if ((cur[i] || '').trim() !== __WORK_LOC_V2_HEADERS__[i]) {
+      sh.getRange(1, i + 1).setValue(__WORK_LOC_V2_HEADERS__[i]);
+    }
+  }
+  sh.setFrozenRows(1);
+  return sh;
+}
+
+/** hh:mm -> minutes (null if invalid) */
+function _hm_toMinutes_(hm) {
+  var m = /^(\d{1,2}):(\d{2})$/.exec(String(hm || '').trim());
+  if (!m) return null;
+  var H = Number(m[1]), M = Number(m[2]);
+  if (H < 0 || H > 23 || M < 0 || M > 59) return null;
+  return H * 60 + M;
+}
+
+/** minutes -> hh:mm (00:00 if invalid) */
+function _minutes_toHM_(mins) {
+  var n = Number(mins);
+  if (!isFinite(n) || n < 0) n = 0;
+  var H = Math.floor(n / 60);
+  var M = Math.round(n % 60);
+  return (H < 10 ? '0' + H : '' + H) + ':' + (M < 10 ? '0' + M : '' + M);
+}
+
+/**
+ * Write today’s plan row for the current analyst.
+ * payload: { dateISO, start_hm, end_hm, lunch_minutes, location }
+ * - analyst_id is ALWAYS the email (lowercased)
+ * - source is 'UI'
+ * - note left blank
+ * Also mirrors location → Live.location_today for a nicer UI.
+ */
+function saveMyWorkPlan(payload) {
+  payload = payload || {};
+  var id = getCurrentAnalystId_();
+  if (!id) throw new Error('No signed in user');
+  var idNorm = normId_(id);
+
+  var now = new Date();
+  var dateISO = String(payload.dateISO || toISODate_(now));
+  var location = String(payload.location || '').trim();
+  var start_hm = String(payload.start_hm || '').trim();
+  var end_hm = String(payload.end_hm || '').trim();
+  var lunch = Number(payload.lunch_minutes);
+  if (!isFinite(lunch) || lunch < 0) lunch = 60;
+
+  // append row (we do not delete previous rows; last wins)
+  var sh = getWorkingLocationsV2Sheet_();
+  sh.appendRow([
+    now.toISOString(),
+    dateISO,
+    idNorm, // <-- email (canonical)
+    location,
+    start_hm,
+    end_hm,
+    lunch,
+    'UI',
+    ''
+  ]);
+
+  // best-effort: surface location to Live immediately
+  try {
+    upsertLive_(idNorm, { location_today: location });
+  } catch (e) {}
+
+  return { ok: true };
+}
+
+/**
+ * Return the latest plan for the given day for the current user.
+ * Shape: { plan: { location, start_hm, end_hm, lunch_minutes } }
+ */
+function getMyWorkPlan(dateISO) {
+  var id = getCurrentAnalystId_();
+  if (!id) throw new Error('No signed in user');
+  var wantDate = String(dateISO || toISODate_(new Date()));
+  var plan = getWorkPlanFor_(id, wantDate);
+  return { plan: plan };
+}
+
+/** Internal: return plan object (or null) for analyst+date. */
+function getWorkPlanFor_(analystId, dateISO) {
+  var sh = getWorkingLocationsV2Sheet_();
+  if (!sh || sh.getLastRow() <= 1) return null;
+
+  var rows = readRows_(sh)
+    .filter(function(r) {
+      return r.date_str === String(dateISO) &&
+             r.analyst_id_norm === normId_(analystId);
+    })
+    .sort(function(a, b){ return (a.ts || 0) - (b.ts || 0); });
+
+  if (!rows.length) return null;
+
+  var last = rows[rows.length - 1];
+  return {
+    location: String(last.location || '').trim(),
+    start_hm: String(last.start_hm || '').trim(),
+    end_hm: String(last.end_hm || '').trim(),
+    lunch_minutes: Number(last.lunch_minutes || 60)
+  };
+}
+
+/**
+ * Used by refreshLiveFor_(id): get only today's location (string or '').
+ */
+function getLocationToday_(analystId) {
+  const plan = getTodayWorkPlan_(analystId);
+  return (plan && plan.location) || '';
+}
