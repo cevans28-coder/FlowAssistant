@@ -6,19 +6,11 @@
  * Columns:
  * id | ts_utc | type | audience | target_email | from_email
  * ref | title | message | status | meta_json
+ *
+ * Depends on:
+ * - master_() (02_master_access.gs)
+ * - normId_() (01_utils.gs) [optional]
  */
-
-function getMasterSS_() {
-  var id = PropertiesService.getScriptProperties().getProperty('MASTER_SHEET_ID');
-  if (id) return SpreadsheetApp.openById(id);
-  var ss = SpreadsheetApp.getActive();
-  if (!ss) throw new Error('MASTER_SHEET_ID not set and no active spreadsheet. Run setMasterSheetId(id).');
-  return ss;
-}
-function setMasterSheetId(id) {
-  PropertiesService.getScriptProperties().setProperty('MASTER_SHEET_ID', id);
-  return { ok:true, id:id };
-}
 
 var Notifications = (function () {
   var SHEET_NAME = 'Notifications';
@@ -28,43 +20,54 @@ var Notifications = (function () {
   ];
 
   // ---------- utils ----------
-  function ss_(){ return getMasterSS_(); }
+  function ss_(){ return master_(); }
   function nowUtc_(){ return new Date().toISOString(); }
+
   function sheet_(){
     var sh = ss_().getSheetByName(SHEET_NAME);
     if (!sh) {
       sh = ss_().insertSheet(SHEET_NAME);
       sh.getRange(1,1,1,HEAD.length).setValues([HEAD]);
       sh.setFrozenRows(1);
-    } else {
-      var width = Math.max(HEAD.length, sh.getLastColumn() || 1);
-      var row = sh.getRange(1,1,1,width).getValues()[0];
-      for (var i=0;i<HEAD.length;i++){
-        if (String(row[i]||'') !== HEAD[i]) sh.getRange(1,i+1).setValue(HEAD[i]);
-      }
+      try { sh.autoResizeColumns(1, HEAD.length); } catch(e){}
+      return sh;
     }
+    // Realign header row non-destructively (prevents column drift)
+    var width = Math.max(HEAD.length, sh.getLastColumn() || 1);
+    var row = sh.getRange(1,1,1,width).getValues()[0];
+    for (var i=0;i<HEAD.length;i++){
+      if (String(row[i]||'') !== HEAD[i]) sh.getRange(1,i+1).setValue(HEAD[i]);
+    }
+    sh.setFrozenRows(1);
     return sh;
   }
+
   function asMap_(row){
     var m = {};
     for (var i=0;i<HEAD.length;i++) m[HEAD[i]] = (row[i]===undefined?'':row[i]);
     return m;
   }
-  function email_(){ try { return Session.getActiveUser().getEmail() || ''; } catch(e){ return ''; } }
-  function json_(o){ try { return JSON.stringify(o||{}); } catch(e){ return '{}'; } }
+
+  function email_(){
+    try { return Session.getActiveUser().getEmail() || ''; } catch(e){ return ''; }
+  }
+  function json_(o){
+    try { return JSON.stringify(o||{}); } catch(e){ return '{}'; }
+  }
+
   function write_(obj){
     var sh = sheet_();
     var row = [
       obj.id || Utilities.getUuid(),
       obj.ts_utc || nowUtc_(),
-      obj.type || 'INFO',
-      obj.audience || 'ALL',
-      obj.target_email || '',
+      obj.type || 'INFO', // INFO | EXCEPTION | NUDGE | ...
+      (obj.audience || 'ALL').toUpperCase(), // TL | ANALYST | ALL
+      (obj.target_email || '').toLowerCase(),
       obj.from_email || email_(),
       obj.ref || '',
       obj.title || '',
       obj.message || '',
-      obj.status || 'NEW',
+      (obj.status || 'NEW').toUpperCase(), // NEW | READ | ARCHIVED
       json_(obj.meta || obj.meta_json)
     ];
     sh.appendRow(row);
@@ -76,7 +79,15 @@ var Notifications = (function () {
   /** Analyst-raised exception -> create canonical exception + TL notification */
   function createExceptionNotification(payload){
     payload = payload || {};
-    var exc = Exceptions.createFromAnalyst(payload); // {ref, minutes, status}
+
+    // Try to create a canonical Exception record if your module exists.
+    // Fallback: synthesise a minimal ref/minutes so the notification still logs.
+    var exc = { ref: 'EXC-' + Utilities.getUuid().slice(0,8), minutes: 0, status: 'NEW' };
+    try {
+      if (typeof Exceptions !== 'undefined' && Exceptions && typeof Exceptions.createFromAnalyst === 'function') {
+        exc = Exceptions.createFromAnalyst(payload) || exc; // {ref, minutes, status}
+      }
+    } catch(e) { /* swallow; keep logging the notification */ }
 
     var me = email_();
     var analystId = String(payload.analyst_id || (me ? me.split('@')[0] : '') || '');
@@ -110,7 +121,7 @@ var Notifications = (function () {
     var n = write_({
       type: 'EXCEPTION',
       audience: 'TL',
-      target_email: '',
+      target_email: '', // broadcast to TLs (client filters)
       from_email: me,
       ref: exc.ref,
       title: title,
@@ -122,9 +133,48 @@ var Notifications = (function () {
     return { ok:true, ref: exc.ref, minutes: exc.minutes, notification_id: n.id };
   }
 
+  /** Generic info message to a specific recipient (or broadcast). */
+  function createInfo(targetEmail, title, message, meta){
+    var me = email_();
+    var n = write_({
+      type: 'INFO',
+      audience: targetEmail ? 'ANALYST' : 'ALL',
+      target_email: targetEmail || '',
+      from_email: me,
+      ref: meta && meta.ref || '',
+      title: String(title || ''),
+      message: String(message || ''),
+      status: 'NEW',
+      meta: meta || {}
+    });
+    return { ok:true, id: n.id };
+  }
+
+  /** Gentle nudge to an analyst (e.g., state mismatch, stale session, etc.). */
+  function createNudge(toAnalystEmail, reason, meta){
+    var me = email_();
+    var n = write_({
+      type: 'NUDGE',
+      audience: 'ANALYST',
+      target_email: String(toAnalystEmail || '').toLowerCase(),
+      from_email: me,
+      ref: meta && meta.ref || '',
+      title: 'Nudge',
+      message: String(reason || 'Please take a look.'),
+      status: 'NEW',
+      meta: meta || {}
+    });
+    return { ok:true, id: n.id };
+  }
+
   /**
-   * params: { audience:'TL'|'ANALYST'|'ALL', target_email?, status?('NEW'|'READ'|'ARCHIVED'|'ANY'), sinceDays? }
-   * returns: { items:[...] } and we HOIST meta fields to top-level for the UI.
+   * params: {
+   * audience:'TL'|'ANALYST'|'ALL',
+   * target_email?, // filter
+   * status?('NEW'|'READ'|'ARCHIVED'|'ANY'),
+   * sinceDays? (default 14)
+   * }
+   * returns: { items:[...] } with selected meta fields hoisted for UI convenience.
    */
   function list(params){
     params = params || {};
@@ -141,19 +191,21 @@ var Notifications = (function () {
     var out = [];
     for (var i=0;i<vals.length;i++){
       var m = asMap_(vals[i]);
-      if (a !== 'ALL' && m.audience !== a) continue;
-      if (params.target_email && m.target_email.toLowerCase() !== String(params.target_email).toLowerCase()) continue;
-      if (status !== 'ANY' && m.status !== status) continue;
+
+      // filters
+      if (a !== 'ALL' && String(m.audience || '').toUpperCase() !== a) continue;
+      if (params.target_email && String(m.target_email || '').toLowerCase() !== String(params.target_email).toLowerCase()) continue;
+      if (status !== 'ANY' && String(m.status || '').toUpperCase() !== status) continue;
       if (new Date(m.ts_utc || vals[i][1]) < cutoff) continue;
 
-      // Parse meta and HOIST fields the UI needs
+      // Parse meta and hoist UI fields
       var meta = {};
       try { meta = JSON.parse(m.meta_json || '{}'); } catch(e){}
       m.from_analyst_id = meta.from_analyst_id || (m.from_email ? String(m.from_email).split('@')[0] : '');
       m.date_iso = meta.date_iso || m.date_iso || '';
       m.start_ts = meta.start_ts || m.start_ts || '';
       m.end_ts = meta.end_ts || m.end_ts || '';
-      m.minutes = meta.minutes != null ? meta.minutes : m.minutes;
+      m.minutes = (meta.minutes != null ? meta.minutes : m.minutes);
       m.category = meta.category || m.category || '';
       m.reason = meta.reason || m.reason || '';
 
@@ -164,12 +216,14 @@ var Notifications = (function () {
   }
 
   function markRead(id){
-    var sh = sheet_(); var last = sh.getLastRow();
+    var sh = sheet_();
+    var last = sh.getLastRow();
     if (last < 2) return { ok:false, error:'no data' };
+
     var vals = sh.getRange(2,1,last-1,HEAD.length).getValues();
     for (var r=0;r<vals.length;r++){
       if (String(vals[r][0]) === String(id)) {
-        vals[r][9] = 'READ';
+        vals[r][9] = 'READ'; // status col
         sh.getRange(r+2,1,1,HEAD.length).setValues([vals[r]]);
         return { ok:true, id:id, status:'READ' };
       }
@@ -178,12 +232,14 @@ var Notifications = (function () {
   }
 
   function archive(id){
-    var sh = sheet_(); var last = sh.getLastRow();
+    var sh = sheet_();
+    var last = sh.getLastRow();
     if (last < 2) return { ok:false, error:'no data' };
+
     var vals = sh.getRange(2,1,last-1,HEAD.length).getValues();
     for (var r=0;r<vals.length;r++){
       if (String(vals[r][0]) === String(id)) {
-        vals[r][9] = 'ARCHIVED';
+        vals[r][9] = 'ARCHIVED'; // status col
         sh.getRange(r+2,1,1,HEAD.length).setValues([vals[r]]);
         return { ok:true, id:id, status:'ARCHIVED' };
       }
@@ -201,7 +257,7 @@ var Notifications = (function () {
   };
 })();
 
-/* Thin wrappers for client */
+/* --------- Thin wrappers for client (kept for compatibility) --------- */
 function createExceptionNotification(payload){ return Notifications.createExceptionNotification(payload); }
 function createInfo(targetEmail, title, message, meta){ return Notifications.createInfo(targetEmail, title, message, meta); }
 function createNudge(toAnalystEmail, reason, meta){ return Notifications.createNudge(toAnalystEmail, reason, meta); }
