@@ -122,3 +122,88 @@ function RUN_FIX_LIVE_DUPES() {
   return { ok: true, kept: keptRows.length, deleted: (v.length - 1) - keptRows.length };
 }
 
+function DEBUG_ListTLExports(){
+  try {
+    Logger.log('TL is ' + (typeof TL));
+    if (typeof TL === 'object' && TL) {
+      var keys = Object.keys(TL).sort();
+      Logger.log('TL keys (' + keys.length + '): ' + keys.join(', '));
+      Logger.log('Calendar fn exists? ' + (typeof TL.getStateCalendarForAnalyst));
+      Logger.log('Stats fn exists? ' + (typeof TL.getStatsForAnalyst));
+    }
+  } catch (e) {
+    Logger.log('Error inspecting TL: ' + e);
+  }
+}
+
+function DEBUG_CallTL(){
+  try {
+    var me = Session.getActiveUser().getEmail();
+    Logger.log('Me: ' + me);
+    if (TL && typeof TL.getStateCalendarForAnalyst === 'function') {
+      var cal = TL.getStateCalendarForAnalyst(me, '2025-01-01', '2025-01-07');
+      Logger.log('Calendar OK: ' + JSON.stringify(cal).slice(0,200));
+    } else {
+      Logger.log('TL.getStateCalendarForAnalyst is not a function');
+    }
+    if (TL && typeof TL.getStatsForAnalyst === 'function') {
+      var st = TL.getStatsForAnalyst(me, '2025-01-01');
+      Logger.log('Stats OK: ' + JSON.stringify(st).slice(0,200));
+    } else {
+      Logger.log('TL.getStatsForAnalyst is not a function');
+    }
+  } catch (e) {
+    Logger.log('DEBUG_CallTL error: ' + (e && e.message || e));
+  }
+}
+
+function _libSmokeTest() {
+  const tz = Session.getScriptTimeZone();
+  const today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+
+  Logger.log('typeof TL_LIB:', typeof TL_LIB);
+  Logger.log('typeof TL_LIB.getStateCalendarForAnalyst:', typeof TL_LIB.getStateCalendarForAnalyst);
+  Logger.log('typeof TL_LIB.getStatsForAnalyst:', typeof TL_LIB.getStatsForAnalyst);
+
+  // If types are "function", try calling them:
+  if (typeof TL_LIB.getStateCalendarForAnalyst === 'function') {
+    const cal = TL_LIB.getStateCalendarForAnalyst('', today, today);
+    Logger.log('Cal OK: ' + JSON.stringify(cal).slice(0, 500));
+  }
+  if (typeof TL_LIB.getStatsForAnalyst === 'function') {
+    const stats = TL_LIB.getStatsForAnalyst('', today);
+    Logger.log('Stats OK: ' + JSON.stringify(stats).slice(0, 500));
+  }
+}
+
+function _listTLLibExports() {
+  try {
+    const names = Object.getOwnPropertyNames(TL_LIB);
+    Logger.log('TL_LIB keys: ' + names.join(', '));
+  } catch (e) {
+    Logger.log('Keys error: ' + e);
+  }
+}
+
+function _libSmokeTest_fixed() {
+  const asStr = v => (typeof v === 'undefined' ? 'undefined' : String(v));
+  Logger.log('typeof TL_LIB = ' + (typeof TL_LIB));
+  Logger.log('typeof TL_LIB.getStateCalendarForAnalyst = ' + (TL_LIB ? typeof TL_LIB.getStateCalendarForAnalyst : 'n/a'));
+  Logger.log('typeof TL_LIB.getStatsForAnalyst = ' + (TL_LIB ? typeof TL_LIB.getStatsForAnalyst : 'n/a'));
+
+  try {
+    const keys = TL_LIB ? Object.getOwnPropertyNames(TL_LIB) : [];
+    Logger.log('TL_LIB keys: ' + keys.join(', '));
+  } catch (e) {
+    Logger.log('TL_LIB keys error: ' + e);
+  }
+}
+
+
+function _checkBoth() {
+  Logger.log('typeof TL = ' + (typeof TL));
+  Logger.log('typeof TL_LIB = ' + (typeof TL_LIB));
+}
+
+function _pingTL()
+{Logger.log(JSON.stringify(TL_LIB.ping()));}
