@@ -1,13 +1,18 @@
 /******************************************************
- * 05_checks.gs — Check logging & validation (optimized)
+ * 05_checks.gs — Check logging & validation (optimized, v2-aware)
  * Depends on:
  * - TZ, SHEETS (00_constants.gs)
- * - toISODate_, normId_, indexMap_ (01_utils.gs)
- * - master_(), getOrCreateMasterSheet_(), readRows_() (02_master_access.gs)
+ * - toISODate_, normId_, indexMap_, readRows_ (01_utils.gs / 02_master_access.gs)
+ * - master_(), getOrCreateMasterSheet_() (02_master_access.gs)
  * - getCurrentAnalystId_(), requireSession_() (03_sessions.gs)
  * - getCurrentStateInfo_(), refreshLiveFor_() (04_state_engine.gs)
  * - updateLiveKPIsFor_() (07_metrics.gs)
+ * - postCheckHooks_() (15_hooks.gs) ← optional, best-effort
  ******************************************************/
+
+// Explicit tab names we read from:
+const STATUS_LOGS_TAB_FOR_STATE = 'StatusLogs_v2'; // v2 source of truth for states
+const CHECK_EVENTS_TAB = (typeof SHEETS !== 'undefined' && SHEETS.CHECK_EVENTS) ? SHEETS.CHECK_EVENTS : 'CheckEvents_v2';
 
 /**
  * Ensure and return the canonical CheckEvents sheet.
@@ -25,12 +30,14 @@ function getCheckEventsSheet_() {
     'rework_flag', // optional
     'state_at_log' // analyst state at the time of logging
   ];
-  const sh = getOrCreateMasterSheet_(SHEETS.CHECK_EVENTS, HEADERS);
+  const sh = getOrCreateMasterSheet_(CHECK_EVENTS_TAB, HEADERS);
 
-  // If sheet already existed but header order drifted, realign the first row.
+  // Realign the first row if order drifted.
   const current = sh.getRange(1, 1, 1, Math.max(HEADERS.length, sh.getLastColumn()))
                     .getValues()[0].map(String);
-  HEADERS.forEach((h, i) => { if ((current[i] || '').trim() !== h) sh.getRange(1, i + 1).setValue(h); });
+  HEADERS.forEach((h, i) => {
+    if ((current[i] || '').trim() !== h) sh.getRange(1, i + 1).setValue(h);
+  });
   sh.setFrozenRows(1);
   return sh;
 }
@@ -41,12 +48,31 @@ function getCheckEventsSheet_() {
  */
 function lastStateFor_(analystId, dateISO) {
   const ss = master_();
-  const rows = readRows_(ss.getSheetByName(SHEETS.STATUS_LOGS))
+  const rows = readRows_(ss.getSheetByName(STATUS_LOGS_TAB_FOR_STATE))
     .filter(r => r.date_str === dateISO && r.analyst_id_norm === normId_(analystId))
     .sort((a, b) => a.ts - b.ts);
 
   const last = rows[rows.length - 1];
   return last ? String(last.state || 'Idle') : 'Idle';
+}
+
+/**
+ * Optional: validate check_type exists in CheckTypes.
+ * We keep this tolerant (UI dropdown typically enforces it).
+ */
+function validateCheckType_(check_type) {
+  const want = String(check_type || '').trim();
+  if (!want) throw new Error('Check Type is required.');
+  try {
+    const list = (typeof readCheckTypes_ === 'function') ? readCheckTypes_() : [];
+    if (!list || !list.length) return; // tolerate if not configured yet
+    const ok = list.some(t => String(t.name).trim() === want);
+    if (!ok) throw new Error('Unknown Check Type: ' + want);
+  } catch (e) {
+    // If CheckTypes read fails for any reason, don’t block logging:
+    // comment out the next line to be strict.
+    // throw e;
+  }
 }
 
 /**
@@ -74,13 +100,7 @@ function validateCaseIdUnique_(caseId) {
   const tf = colRange.createTextFinder(uid);
   tf.matchCase(false).matchEntireCell(false);
 
-  // TextFinder can produce false positives (substring matches).
-  // Verify exact matches case-insensitively.
-  const hit = tf.findNext();
-  if (!hit) return; // no textual hit → unique
-
-  // We only need to confirm collision if an exact (trim, lower) match exists.
-  // If you want to be extra safe, scan only the handful of candidate cells in the column.
+  // TextFinder can produce substring matches; verify exact trims in column.
   const values = colRange.getValues().flat().filter(Boolean);
   const want = uid.toLowerCase();
   const dup = values.some(v => String(v).trim().toLowerCase() === want);
@@ -104,9 +124,10 @@ function coerceDurationMins_(value) {
  * - Writes a single row to CheckEvents
  * - Refreshes Live to keep UI & TL data fresh
  * - Delegates KPI updates to updateLiveKPIsFor_() so KPI math is centralized
+ * - Optionally runs postCheckHooks_ (rebuild per-type & replace DailyMetrics row)
  *
  * @param {string} token Session token from the UI
- * @param {string} check_type Must exist in CheckTypes (we do not enforce existence here — UX shows a dropdown)
+ * @param {string} check_type Must exist in CheckTypes (dropdown-enforced in UI)
  * @param {string} case_id Required, globally unique across all analysts & days
  * @param {number} duration_mins Positive minutes
  * @param {string} result Optional
@@ -116,36 +137,82 @@ function coerceDurationMins_(value) {
 function completeCheck(token, check_type, case_id, duration_mins, result, rework_flag) {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(3000)) throw new Error('Please try again (another update is in progress).');
+
   try {
-    requireSession_(token);
+    token = requireSessionOrAdopt_(token);
+
+    // Inputs
+    validateCheckType_(check_type);
     const type = String(check_type || '').trim();
-    if (!type) throw new Error('Check Type is required.');
+
     const uid = String(case_id || '').trim();
     if (!uid) throw new Error('Case ID (MP scorecard UID) is required.');
-    const dur = Number(duration_mins);
-    if (!dur || dur <= 0) throw new Error('Please enter a positive duration (minutes).');
 
+    const dur = coerceDurationMins_(duration_mins);
+
+    // Global duplicate guard on case_id
     validateCaseIdUnique_(uid);
 
+    // Timestamps & identity
     const ts = new Date();
     const dateISO = toISODate_(ts);
     const id = getCurrentAnalystId_();
     const stateAtLog = lastStateFor_(id, dateISO);
 
-    const sh = getOrCreateMasterSheet_(SHEETS.CHECK_EVENTS, [
-      'completed_at_iso','date','analyst_id','check_type','case_id',
-      'duration_mins','result','rework_flag','state_at_log'
+    // Append to CheckEvents
+    const sh = getCheckEventsSheet_();
+    sh.appendRow([
+      ts.toISOString(), // completed_at_iso
+      dateISO, // date
+      id, // analyst_id
+      type, // check_type
+      uid, // case_id
+      dur, // duration_mins
+      String(result || ''), // result
+      String(rework_flag || ''), // rework_flag
+      stateAtLog // state_at_log
     ]);
-    sh.appendRow([ts.toISOString(), dateISO, id, type, uid, dur, String(result||''), String(rework_flag||''), stateAtLog]);
 
+    // Keep Live fresh; KPI math centralized
     refreshLiveFor_(id);
+    try { _bustTodaySummaryCache_(id); } catch(e) {}
     try { updateLiveKPIsFor_(id); } catch(e) {}
-    try {postCheckHooks_(analystId, dateISO);} catch (e) {}
-    
-    return { ok:true, ts: ts.toISOString(), analyst_id:id, check_type:type, state_at_log:stateAtLog };
+
+    // Optional hook for downstream pipelines (only if you’ve defined it)
+    try {
+      if (typeof postCheckHooks_ === 'function') {
+        postCheckHooks_(id, dateISO);
+      }
+    } catch (e) {
+      // Non-fatal by design
+    }
+
+    return { ok: true, ts: ts.toISOString(), analyst_id: id, check_type: type, state_at_log: stateAtLog };
   } finally {
-    try { lock.releaseLock(); } catch(e) {}
-    
-   
+    try { lock.releaseLock(); } catch (e) {}
   }
+}
+
+/* ------------------ Small helpers / diagnostics (optional) ------------------ */
+
+/** Quick helper to check if a Case ID exists (case-insensitive). */
+function caseIdExists_(caseId) {
+  try {
+    const sh = getCheckEventsSheet_();
+    const hdr = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(String);
+    const idx = indexMap_(hdr);
+    const col = idx['case_id'];
+    if (col == null || sh.getLastRow() <= 1) return false;
+    const vals = sh.getRange(2, col + 1, sh.getLastRow() - 1, 1).getValues().flat();
+    const want = String(caseId || '').trim().toLowerCase();
+    return vals.some(v => String(v || '').trim().toLowerCase() === want);
+  } catch (e) {
+    return false;
+  }
+}
+
+/** Smoke: append a fake check for the current user (use sparingly). */
+function CHECKS_Smoke_AppendFake() {
+  const tok = makeToken_(); setSessionTokenFor_(getCurrentAnalystId_(), tok);
+  return completeCheck(tok, 'Sample Check Type', 'DEMO-' + Utilities.getUuid().slice(0, 8), 7, 'OK', 'N');
 }
