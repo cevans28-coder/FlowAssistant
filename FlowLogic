@@ -1,37 +1,115 @@
 <script>
 /* =========================
- * FlowLogic — UI behaviour
- * (Flow Assistant – updated to show Exceptions and subtract them from working hours)
+ * FlowLogic — UI behaviour (FULL, patched)
  * ========================= */
 
 /* ---------- session + UI state ---------- */
 let SESSION_TOKEN = null;
 let sinceTs = null, stateTimerId = null;
 let currentState = 'Idle';
+const CLIENT_VER = 'overlay-insights-v4';
 
-/* ---------- helpers ---------- */
-const el = id => document.getElementById(id);
-const toISODate = (d)=>{
-  const x = d instanceof Date ? new Date(d) : new Date();
-  x.setMinutes(x.getMinutes() - x.getTimezoneOffset());
-  return x.toISOString().slice(0,10);
+// --- optimistic state protection (prevents bounce-back from slow server) ---
+let __stateOptimistic = null; // 'Working', 'Admin', ...
+let __stateOptimisticUntil = 0; // epoch ms; while in this window we ignore mismatching server states
+
+function isOptimisticActive(){
+  return !!__stateOptimistic && Date.now() < __stateOptimisticUntil;
+}
+
+/* ===== Working Plan model kept in memory =====
+   - location is locked once a plan exists for the day
+   - start_hm/end_hm/lunch_minutes stay editable */
+let __PLAN__ = {
+  dateISO: null,
+  location: '',
+  start_hm: '',
+  end_hm: '',
+  lunch_minutes: 60,
+  locked_location: false
 };
-function setBtnLoading(btn, text){
-  if (!btn) return;
-  btn.classList.add('loading');
-  if (typeof text==='string') btn.textContent = text;
-}
-function clearBtnLoading(btn, text){
-  if (!btn) return;
-  btn.classList.remove('loading');
-  if (typeof text==='string') btn.textContent = text;
+
+/** True if the user has chosen a location for today (times are NOT required) */
+function planIsValid(){
+  return !!(__PLAN__ && __PLAN__.location && String(__PLAN__.location).trim());
 }
 
-/* ---------- state visuals ---------- */
+/**
+ * Only accept a server state if:
+ * - We’re not in an optimistic window, AND
+ * - Server’s since >= our local sinceTs (i.e., not older), OR
+ * - Server state equals our current UI state (safe refresh)
+ */
+function serverChangeIsNewerOrMatching(serverState, serverSinceIso){
+  try {
+    if (isOptimisticActive()) return false; // UI owns state while optimistic
+    if (!serverState) return false;
+
+    if (serverState === currentState) return true; // same state is fine
+
+    const sSince = serverSinceIso ? Date.parse(serverSinceIso) : 0;
+    if (!sinceTs) return !!serverState; // no local time → accept
+    return sSince >= sinceTs;
+  } catch (_) {
+    return false;
+  }
+}
+
+/* ---------- tiny helpers ---------- */
+const $ = (s, r=document) => r.querySelector(s);
+const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
+const el = (id) => document.getElementById(id);
+function toISODate(d){
+  const x = d instanceof Date ? new Date(d) : new Date();
+  x.setMinutes(x.getMinutes()-x.getTimezoneOffset());
+  return x.toISOString().slice(0,10);
+}
+function todayLocalISO(){ return toISODate(new Date()); }
+function yesterdayISO(){
+  const d = new Date(); d.setDate(d.getDate()-1);
+  return toISODate(d);
+}
+function setBtnLoading(btn, text){ if(!btn) return; btn.classList.add('loading'); if (text) btn.textContent = text; }
+function clearBtnLoading(btn, text){ if(!btn) return; btn.classList.remove('loading'); if (text) btn.textContent = text; }
+
+/* ---------- local caches ---------- */
+const LS_TIMERS = 'flow_multi_timers_v1';
+const LS_LABELS = 'flow_timer_labels_v1';
+function getLabelMap(){ try{ return JSON.parse(localStorage.getItem(LS_LABELS)||'{}'); }catch(e){ return {}; } }
+function saveLabel(key, val){ const m=getLabelMap(); m[key]=String(val||'').trim(); localStorage.setItem(LS_LABELS, JSON.stringify(m)); }
+function getSavedLabel(key){ return String(getLabelMap()[key]||''); }
+function clearLabel(key){ const m=getLabelMap(); delete m[key]; localStorage.setItem(LS_LABELS, JSON.stringify(m)); }
+
+/* ======================================================================
+ * SILENT ACTION QUEUE (serializes google.script.run calls)
+ * ====================================================================== */
+class ActionQueue {
+  constructor(){ this.q=[]; this.busy=false; }
+  enqueue(name, doCall){
+    this.q.push({ name, doCall });
+    this._drain();
+  }
+  _drain(){
+    if (this.busy || !this.q.length) return;
+    const item = this.q.shift();
+    this.busy = true;
+    try{
+      item.doCall(()=>{ this.busy=false; this._drain(); },
+                  ()=>{ this.busy=false; this._drain(); });
+    }catch(_){
+      this.busy=false; this._drain();
+    }
+  }
+}
+const queue = new ActionQueue();
+
+/* ======================================================================
+ * STATE VISUALS
+ * ====================================================================== */
 function stateClassFor(state){
   const s = String(state||'').toLowerCase();
   if (s === 'working') return 'ok';
-  if (['meeting','training','coaching','admin'].includes(s)) return 'warn';
+  if (['meeting','training','coaching','admin','break','lunch'].includes(s)) return 'warn';
   if (['loggedout','ooo'].includes(s)) return 'danger';
   return 'idle';
 }
@@ -41,104 +119,385 @@ function stateLabelFor(state){
   return s || 'Idle';
 }
 function paintState(state){
-  const dot = el('stateDot');
-  if (dot) dot.className = 'dot ' + stateClassFor(state);
-  const st = el('stateText');
-  if (st) st.textContent = stateLabelFor(state);
+  const dot = el('stateDot'); if (dot) dot.className = 'dot ' + stateClassFor(state);
+  const st = el('stateText'); if (st) st.textContent = stateLabelFor(state);
   currentState = state || 'Idle';
-  updateStartGate();
 }
 
-/* ---------- badge state menu ---------- */
-const stateMenu = () => document.getElementById('stateMenu');
+/* ======================================================================
+ * WORKING LOCATION: NON-DESTRUCTIVE PAINT
+ * ====================================================================== */
+/**
+ * Populate the Working Location + Times area from today's plan.
+ * IMPORTANT: This is now **non-destructive** — it only writes fields that
+ * are actually present in the `plan` object and never clears a previously
+ * loaded/locked location if the server returns nothing.
+ *
+ * Lock rules:
+ * - Location: locked if there is already a saved location for today.
+ * - Times (start/end/lunch): always editable.
+ */
+function populateWorkingLocationUI(plan) {
+  const select = el('workLocation');
+  const startEl = el('workStart');
+  const endEl = el('workEnd');
+  const lunchEl = el('workLunch');
+  const msg = el('locMsg');
+
+  const p = plan || {};
+  const hasAny =
+    (p.location && String(p.location).trim()) ||
+    (p.start_hm && /^\d{1,2}:\d{2}$/.test(p.start_hm)) ||
+    (p.end_hm && /^\d{1,2}:\d{2}$/.test(p.end_hm)) ||
+    (p.lunch_minutes != null);
+
+  // If server provided nothing meaningful, DO NOT touch current UI/locks.
+  if (!hasAny) return;
+
+  const hasLocation = !!(p.location && String(p.location).trim());
+  const startHM = p.start_hm;
+  const endHM = p.end_hm;
+  const lunchMin = (p.lunch_minutes != null) ? Number(p.lunch_minutes) : undefined;
+
+  // Fill values only if provided
+  if (select && hasLocation) select.value = p.location;
+  if (startEl && startHM) startEl.value = startHM;
+  if (endEl && endHM) endEl.value = endHM;
+  if (lunchEl && lunchMin != null && Number.isFinite(lunchMin)) lunchEl.value = String(lunchMin);
+
+  // --- Lock rules (location only) ---
+  if (select) {
+    if (hasLocation) {
+      select.setAttribute('disabled', 'true');
+      select.setAttribute('aria-disabled', 'true');
+      select.title = 'Location is locked for today';
+      select.dataset.locked = '1';
+    } else {
+      // if we didn't receive a location we do NOT change the current lock state
+    }
+  }
+
+  // Times: always editable
+  ['workStart','workEnd','workLunch'].forEach(id => {
+    const i = el(id);
+    if (!i) return;
+    i.removeAttribute('readonly');
+    i.removeAttribute('disabled');
+  });
+
+  // UX message
+  if (msg && hasLocation) {
+    const extra = (startHM && endHM)
+      ? ` (${startHM}–${endHM}${(lunchMin!=null)?`, lunch ${lunchMin}m`:''})`
+      : '';
+    msg.innerHTML = `<span class="ok">Loaded: ${p.location}${extra}</span>`;
+  }
+
+  // Keep memory up to date without wiping existing values
+  __PLAN__.location = hasLocation ? p.location : (__PLAN__.location || '');
+  if (startHM) __PLAN__.start_hm = startHM;
+  if (endHM) __PLAN__.end_hm = endHM;
+  if (lunchMin != null && Number.isFinite(lunchMin)) __PLAN__.lunch_minutes = lunchMin;
+  __PLAN__.locked_location = __PLAN__.locked_location || hasLocation;
+}
+
+/** Read plan inputs (single, canonical definition) */
+function readPlanInputs(){
+  const sel = el('workLocation');
+  const st = el('workStart');
+  const en = el('workEnd');
+  const ln = el('workLunch');
+  return {
+    location: sel ? sel.value : (__PLAN__?.location||''),
+    start_hm: st ? st.value : (__PLAN__?.start_hm||''),
+    end_hm: en ? en.value : (__PLAN__?.end_hm||''),
+    lunch_minutes: ln ? Number(ln.value || 60) : (__PLAN__?.lunch_minutes||60)
+  };
+}
+
+/**
+ * Save button handler for Working Location & Times.
+ * - First save with a chosen Location locks Location for the day.
+ * - If Location already locked, only times are updated.
+ * - UI updates are optimistic and silent; server write is queued.
+ */
+function wireWorkingLocation() {
+  const btn = el('btnSaveLocation');
+  if (!btn) return;
+
+  // default lunch to 60 if empty
+  const ln = el('workLunch'); if (ln && !ln.value) ln.value = '60';
+
+  // times always editable
+  ['workStart','workEnd','workLunch'].forEach(id => {
+    const i = el(id);
+    if (i) { i.removeAttribute('readonly'); i.removeAttribute('disabled'); }
+  });
+
+  btn.addEventListener('click', () => {
+    const select = el('workLocation');
+    const locked = !!(select && select.dataset.locked === '1');
+
+    // Read inputs
+    const next = {
+      location: locked ? (__PLAN__?.location || '') : ((select && select.value) || ''), // ignore changes if locked
+      start_hm: (el('workStart')?.value || '').trim(),
+      end_hm: (el('workEnd')?.value || '').trim(),
+      lunch_minutes: Number(el('workLunch')?.value || 60)
+    };
+
+    // If not locked yet, require a location (silent blink)
+    if (!locked && !next.location) {
+      if (select) {
+        select.classList.add('loading');
+        setTimeout(() => select.classList.remove('loading'), 500);
+      }
+      return;
+    }
+
+    // Optimistic local state update (without wiping previous values)
+    if (!locked && next.location) __PLAN__.location = next.location;
+    if (next.start_hm) __PLAN__.start_hm = next.start_hm;
+    if (next.end_hm) __PLAN__.end_hm = next.end_hm;
+    if (Number.isFinite(next.lunch_minutes)) __PLAN__.lunch_minutes = next.lunch_minutes;
+
+    // Reflect immediately in UI (applies lock on first save)
+    populateWorkingLocationUI({
+      location: __PLAN__.location,
+      start_hm: __PLAN__.start_hm,
+      end_hm: __PLAN__.end_hm,
+      lunch_minutes: __PLAN__.lunch_minutes
+    });
+
+    // Queue the server write (silent)
+    const day = todayLocalISO();
+    const payload = {
+      dateISO: day,
+      start_hm: __PLAN__.start_hm,
+      end_hm: __PLAN__.end_hm,
+      lunch_minutes: __PLAN__.lunch_minutes,
+      location: __PLAN__.location
+    };
+
+    if (window.queue && typeof queue.enqueue === 'function') {
+      queue.enqueue('savePlan', (ok) => {
+        google.script.run
+          .withSuccessHandler(() => ok())
+          .withFailureHandler(() => ok()) // silent
+          .saveMyWorkPlan(payload);
+      });
+    } else {
+      google.script.run
+        .withSuccessHandler(() => {})
+        .withFailureHandler(() => {})
+        .saveMyWorkPlan(payload);
+    }
+  });
+}
+
+/** Load today’s plan from server, paint UI, and set memory model (__PLAN__). */
+function loadAndApplyTodayPlan(){
+  const day = (function(){ const d=new Date(); d.setMinutes(d.getMinutes()-d.getTimezoneOffset()); return d.toISOString().slice(0,10); })();
+
+  google.script.run
+    .withSuccessHandler(res=>{
+      const plan = res && res.plan ? res.plan : null;
+
+      // Keep memory up to date
+      __PLAN__.dateISO = day;
+      if (plan && plan.location) __PLAN__.location = plan.location;
+      if (plan && plan.start_hm) __PLAN__.start_hm = plan.start_hm;
+      if (plan && plan.end_hm) __PLAN__.end_hm = plan.end_hm;
+      if (plan && plan.lunch_minutes != null) __PLAN__.lunch_minutes = Number(plan.lunch_minutes) || 60;
+      __PLAN__.locked_location = !!(plan && plan.location);
+
+      // Paint UI with **non-destructive** logic
+      populateWorkingLocationUI(plan || {});
+    })
+    .withFailureHandler(()=>{
+      __PLAN__.dateISO = day;
+      // Leave UI as-is if we can't load; times remain editable
+    })
+    .getMyWorkPlan(day);
+}
+
+/* ======================================================================
+ * STATE MENU (no plan gating)
+ * ====================================================================== */
+// Convenience getter for the floating menu node
+const stateMenuEl = () => el('stateMenu');
+
+/** Open the state menu next to the badge (no plan gating) */
 function showStateMenu(options){
-  const menu = stateMenu();
-  if (!menu) return;
+  const menu = stateMenuEl(); if (!menu) return;
   menu.innerHTML = (options||[]).map(s=>`<button data-state="${s}">${s}</button>`).join('');
-  const badge = el('stateBadge');
-  if (!badge) return;
-  menu.style.left = '0px';
-  menu.style.top = (badge.offsetTop + badge.offsetHeight) + 'px';
+
+  const badge = el('stateBadge'); if (!badge) return;
+  const rect = badge.getBoundingClientRect();
+  menu.style.left = rect.left + 'px';
+  menu.style.top = (rect.bottom + 6 + window.scrollY) + 'px';
   menu.style.display = 'block';
 }
-function hideStateMenu(){ const m = stateMenu(); if (m) m.style.display='none'; }
-document.addEventListener('click', (e)=>{
-  const menu = stateMenu(); if (!menu) return;
-  if (e.target.closest('#stateBadge')) return;
-  if (!menu.contains(e.target)) hideStateMenu();
-});
 
-/* ---------- window controls ---------- */
-let minimized = false;
-document.addEventListener('DOMContentLoaded', ()=>{
-  const btnMin = el('btnMin');
-  if (btnMin) btnMin.addEventListener('click', () => {
-    minimized = !minimized;
-    const c = el('content');
-    if (c) c.classList.toggle('hidden', minimized);
-    try { google.script.host.setHeight(minimized?60:720); google.script.host.setWidth(minimized?360:520); } catch(e){}
-  });
-
-  const btnPop = el('btnPop');
-  if (btnPop) btnPop.addEventListener('click', () => {
-    google.script.run.withSuccessHandler(cfg => {
-      if (cfg && cfg.web_app_url) window.open(cfg.web_app_url, '_blank');
-      else alert('Add WEB_APP_URL in MASTER → Settings.');
-    }).getClientConfig();
-  });
-
-  const btnLogOff = el('btnLogOff');
-  if (btnLogOff) btnLogOff.addEventListener('click', () => {
-    const btn = el('btnLogOff');
-    setBtnLoading(btn, 'Logging off…');
-    google.script.run.withSuccessHandler(() => {
-      clearBtnLoading(btn, '⏻');
-      paintState('LoggedOut'); sinceTs=Date.now(); startStateTimer();
-    }).withFailureHandler(()=>{
-      clearBtnLoading(btn, '⏻');
-    }).logOff(SESSION_TOKEN,'User pressed Log Off');
-  });
-});
-window.addEventListener('beforeunload', () => {
-  persistTimer_();
-  try{ google.script.run.logOff(SESSION_TOKEN,'Window closed'); }catch(e){}
-});
-
-/* ---------- inactivity auto-logoff (60m) ---------- */
-let inactivityTimer=null;
-const resetInactivity=()=>{ if (inactivityTimer) clearTimeout(inactivityTimer); inactivityTimer=setTimeout(()=> google.script.run.logOff(SESSION_TOKEN,'Auto logoff after 60m inactivity'), 60*60*1000); };
-['mousemove','keydown','click','scroll','touchstart'].forEach(ev => window.addEventListener(ev, resetInactivity));
-resetInactivity();
-
-/* ---------- since timer ---------- */
-function startStateTimer(){
-  if (!sinceTs){ const st=el('stateTimer'); if (st) st.textContent='00:00:00'; return; }
-  if (stateTimerId) clearInterval(stateTimerId);
-  function tick(){
-    const diff=Math.max(0,Math.floor((Date.now()-sinceTs)/1000));
-    const hh=String(Math.floor(diff/3600)).padStart(2,'0');
-    const mm=String(Math.floor((diff%3600)/60)).padStart(2,'0');
-    const ss=String(diff%60).padStart(2,'0');
-    const st = el('stateTimer'); if (st) st.textContent=`${hh}:${mm}:${ss}`;
-  }
-  tick(); stateTimerId=setInterval(tick,1000);
+/** Hide the floating state menu */
+function hideStateMenu(){
+  const m = stateMenuEl();
+  if (m) m.style.display = 'none';
 }
 
-/* ---------- heartbeat + reconcile ---------- */
+/** Wire state badge + menu interactions */
+function wireStateBadge(){
+  // Badge click → open menu (if states are loaded)
+  const badge = el('stateBadge');
+  if (badge) {
+    badge.addEventListener('click', ()=>{
+      if (!window.__ALL_STATES || !__ALL_STATES.length) return;
+      showStateMenu(__ALL_STATES);
+    });
+  }
+
+  // Handle a click on one of the state buttons inside the menu
+  const menu = stateMenuEl();
+  if (menu) {
+    menu.addEventListener('click', (e)=>{
+      const btn = e.target.closest('button[data-state]');
+      if (!btn) return;
+
+      const newState = btn.getAttribute('data-state');
+      hideStateMenu();
+
+      // --- Optimistic UI: paint immediately and protect for 20s
+      const prev = currentState;
+      paintState(newState);
+      sinceTs = Date.now();
+      startStateSinceTimer();
+
+      __stateOptimistic = newState;
+      __stateOptimisticUntil = Date.now() + 20000;
+
+      if (prev==='Working' && newState!=='Working'){ pauseAllRunningTimers('state'); }
+      if (prev!=='Working' && newState==='Working'){ resumeTimersPausedByState(); }
+
+      // Queue write → keep silent either way
+      google.script.run
+        .withSuccessHandler(d=>{
+          sinceTs = (d && d.ts) ? Date.parse(d.ts) : sinceTs;
+          startStateSinceTimer();
+          __stateOptimistic = null;
+          __stateOptimisticUntil = 0;
+
+          const msg = el('stateMsg');
+          if (msg) msg.innerHTML = `<span class="ok">State set: ${d.state} @ ${new Date(sinceTs).toLocaleTimeString()}</span>`;
+
+          if (typeof refreshSummary === 'function') refreshSummary();
+        })
+        .withFailureHandler(err=>{
+          // Rollback on failure
+          paintState(prev);
+          if (prev==='Working' && newState!=='Working'){ resumeTimersPausedByState(); }
+          if (prev!=='Working' && newState==='Working'){ pauseAllRunningTimers('state'); }
+          __stateOptimistic = null;
+          __stateOptimisticUntil = 0;
+
+          const msg = el('stateMsg');
+          if (msg) msg.innerHTML = `<span class="warn">${(err && err.message) || err}</span>`;
+        })
+        .setState(SESSION_TOKEN, newState, '');
+    });
+  }
+
+  // Click anywhere outside the menu → close it
+  document.addEventListener('click', (e)=>{
+    const m = stateMenuEl(); if (!m) return;
+    if (e.target.closest('#stateBadge')) return; // ignore clicks on the badge
+    if (!m.contains(e.target)) hideStateMenu();
+  });
+}
+
+/* ======================================================================
+ * SINCE TIMER
+ * ====================================================================== */
+function startStateSinceTimer(){
+  const tEl = el('stateTimer'); if (!tEl) return;
+  if (!sinceTs){ tEl.textContent = '00:00:00'; return; }
+  if (stateTimerId) clearInterval(stateTimerId);
+  function tick(){
+    const diff = Math.max(0, Math.floor((Date.now()-sinceTs)/1000));
+    const hh = String(Math.floor(diff/3600)).padStart(2,'0');
+    const mm = String(Math.floor((diff%3600)/60)).padStart(2,'0');
+    const ss = String(diff%60).padStart(2,'0');
+    tEl.textContent = `${hh}:${mm}:${ss}`;
+  }
+  tick(); stateTimerId = setInterval(tick, 1000);
+}
+
+/* ======================================================================
+ * HEARTBEAT + RECONCILE (silent)
+ * ====================================================================== */
+function reconcileFromServer(){
+  google.script.run.withSuccessHandler(s=>{
+    if (!s) return;
+
+    if (isOptimisticActive()) {
+      if (s.state && s.state === __stateOptimistic) {
+        const prev = currentState;
+        if (prev !== s.state) {
+          if (prev === 'Working' && s.state !== 'Working') pauseAllRunningTimers('state');
+          if (prev !== 'Working' && s.state === 'Working') resumeTimersPausedByState();
+        }
+        paintState(s.state);
+        if (s.since_iso) {
+          sinceTs = Date.parse(s.since_iso);
+          startStateSinceTimer();
+        }
+        __stateOptimistic = null;
+        __stateOptimisticUntil = 0;
+      }
+      return;
+    }
+
+    if (serverChangeIsNewerOrMatching(s.state, s.since_iso)) {
+      if (s.state && s.state !== currentState) {
+        const prev = currentState;
+        if (prev === 'Working' && s.state !== 'Working') pauseAllRunningTimers('state');
+        if (prev !== 'Working' && s.state === 'Working') resumeTimersPausedByState();
+        paintState(s.state);
+      }
+      sinceTs = s.since_iso ? Date.parse(s.since_iso) : sinceTs;
+      startStateSinceTimer();
+
+      const msg = el('stateMsg');
+      if (msg && s.state) {
+        const when = new Date(s.since_iso || Date.now()).toLocaleTimeString();
+        msg.innerHTML = `<span class="ok">State set: ${s.state} @ ${when}</span>`;
+      }
+    }
+  }).getTodaySummary();
+}
+
 function heartbeatAndReconcile(){
-  google.script.run.withSuccessHandler(()=> { reconcileFromServer(); }).heartbeat(SESSION_TOKEN);
+  const payload = { clientVer: CLIENT_VER };
+  google.script.run.withSuccessHandler(()=>{ reconcileFromServer(); })
+    .heartbeat(SESSION_TOKEN, payload);
 }
 function startHeartbeat(){
   heartbeatAndReconcile();
   setInterval(heartbeatAndReconcile, 60000);
 }
 
-/* ---------- check timer (persistent) ---------- */
-const TIMER_STORE_KEY = 'flow_check_timer_v1';
-let checkTimer = {
-  running: false, paused: false, pausedDueToState: false,
-  startMs: 0, accMs: 0, tickId: null
+/* ======================================================================
+ * MULTI–TIMERS A–D
+ * ====================================================================== */
+const TIMER_KEYS = ['A','B','C','D'];
+const timers = {
+  A: { running:false, paused:false, pausedDueToState:false, startMs:0, accMs:0 },
+  B: { running:false, paused:false, pausedDueToState:false, startMs:0, accMs:0 },
+  C: { running:false, paused:false, pausedDueToState:false, startMs:0, accMs:0 },
+  D: { running:false, paused:false, pausedDueToState:false, startMs:0, accMs:0 },
 };
+let tickInterval = null;
+let activeTimerTab = 'A';
+
 function msToHMS(ms){
   const s = Math.max(0, Math.floor(ms/1000));
   const hh=String(Math.floor(s/3600)).padStart(2,'0');
@@ -146,439 +505,672 @@ function msToHMS(ms){
   const ss=String(s%60).padStart(2,'0');
   return `${hh}:${mm}:${ss}`;
 }
-function mmToHoursMinutes(mm){ const m=Math.max(0,Math.round(mm||0)); const h=Math.floor(m/60); const rem=m%60; return `${h}h ${rem}m`; }
-function updateStartGate(){
-  const canStart = (currentState === 'Working') && !checkTimer.running && checkTimer.accMs === 0;
-  const b = el('btnStartCheck'); if (b) b.disabled = !canStart;
+function totalMs(t){ return t.accMs + (t.running && !t.paused ? (Date.now() - t.startMs) : 0); }
+function updateTimerDisplay(key){
+  const t = timers[key];
+  const disp = el(`timerDisplay-${key}`); if (disp) disp.textContent = msToHMS(totalMs(t));
+  const bStart = el(`btnStart-${key}`); if (bStart) bStart.disabled = !(currentState === 'Working' && !t.running && t.accMs === 0);
+  const bPause = el(`btnPause-${key}`); if (bPause){ bPause.disabled = !t.running; bPause.textContent = t.paused ? 'Resume' : 'Pause'; }
+  const bEnd = el(`btnEnd-${key}`); if (bEnd) bEnd.disabled = !t.running && t.accMs === 0;
+  const bReset = el(`btnReset-${key}`); if (bReset) bReset.disabled = t.running || (totalMs(t) === 0);
 }
-function updateCheckTimerUI(){
-  const total = checkTimer.accMs + (checkTimer.running && !checkTimer.paused ? (Date.now()-checkTimer.startMs) : 0);
-  const disp = el('checkTimerDisplay'); if (disp) disp.textContent = msToHMS(total);
-  const s = el('btnStartCheck'); if (s) s.disabled = !(currentState === 'Working' && !checkTimer.running && checkTimer.accMs === 0);
-  const p = el('btnPauseCheck'); if (p){ p.disabled = !checkTimer.running; p.textContent = checkTimer.paused ? 'Resume' : 'Pause'; }
-  const e = el('btnEndCheck'); if (e) e.disabled = !checkTimer.running && checkTimer.accMs === 0;
-}
-function persistTimer_(){
-  let acc = checkTimer.accMs;
-  if (checkTimer.running && !checkTimer.paused) acc += (Date.now() - checkTimer.startMs);
-  const payload = { running:false, paused:true, pausedDueToState:true, accMs: Math.max(0, Math.floor(acc)), snapshotTs: Date.now() };
-  try { localStorage.setItem(TIMER_STORE_KEY, JSON.stringify(payload)); } catch(e){}
-}
-function loadTimer_(){
-  try {
-    const raw = localStorage.getItem(TIMER_STORE_KEY);
-    if (!raw) return;
+function updateAllDisplays(){ TIMER_KEYS.forEach(updateTimerDisplay); }
+function persistAllTimers_(){ try { localStorage.setItem(LS_TIMERS, JSON.stringify(timers)); } catch(e){} }
+function loadTimers_(){
+  try{
+    const raw = localStorage.getItem(LS_TIMERS); if (!raw) return;
     const d = JSON.parse(raw);
-    checkTimer.running = false; checkTimer.paused = true; checkTimer.pausedDueToState = true;
-    checkTimer.accMs = Math.max(0, Number(d.accMs)||0); checkTimer.startMs = 0;
-    if (checkTimer.tickId) clearInterval(checkTimer.tickId); checkTimer.tickId = null;
-    updateCheckTimerUI();
-    const tm = el('timerMsg'); if (tm) tm.textContent = checkTimer.accMs>0 ? 'Restored timer (paused).' : '';
-  } catch(e){}
+    TIMER_KEYS.forEach(k=>{
+      if (d[k]){
+        timers[k].running = false; timers[k].paused = true;
+        timers[k].pausedDueToState = !!d[k].pausedDueToState;
+        timers[k].accMs = Math.max(0, Number(d[k].accMs)||0);
+        timers[k].startMs = 0;
+      }
+    });
+  }catch(_){}
 }
-function startCheckTimer(){
-  if (currentState!=='Working'){ const tm=el('timerMsg'); if (tm) tm.textContent='Start is only available in Working.'; return; }
-  if (checkTimer.running || checkTimer.accMs>0) { updateCheckTimerUI(); return; }
-  checkTimer.running = true; checkTimer.paused = false; checkTimer.pausedDueToState = false;
-  checkTimer.startMs = Date.now();
-  if (checkTimer.tickId) clearInterval(checkTimer.tickId);
-  checkTimer.tickId = setInterval(()=>{ updateCheckTimerUI(); if (!checkTimer.paused) persistTimer_(); }, 1000);
-  const tm = el('timerMsg'); if (tm) tm.textContent = '';
-  updateCheckTimerUI(); persistTimer_();
+function ensureTicking(){
+  if (tickInterval) return;
+  tickInterval = setInterval(()=>{ TIMER_KEYS.forEach(updateTimerDisplay); persistAllTimers_(); }, 1000);
 }
-function pauseCheckTimer(reason){
-  if (!checkTimer.running) return;
-  if (!checkTimer.paused){
-    checkTimer.accMs += (Date.now() - checkTimer.startMs);
-    checkTimer.paused = true;
-    if (reason === 'state') checkTimer.pausedDueToState = true;
-    const tm = el('timerMsg'); if (tm) tm.textContent = `Paused${reason==='state'?' (state change)':''}.`;
-    if (checkTimer.tickId) clearInterval(checkTimer.tickId); checkTimer.tickId = null;
+function setTimerMsg(key, text){ const m = el(`timerMsg-${key}`); if (m) m.textContent = text || ''; }
+
+function startTimer(key){
+  const t = timers[key];
+  if (currentState!=='Working'){ setTimerMsg(key,''); return; } // silent
+  if (t.running || t.accMs>0){ updateTimerDisplay(key); return; }
+  t.running = true; t.paused = false; t.pausedDueToState = false; t.startMs = Date.now();
+  setTimerMsg(key,''); updateTimerDisplay(key); ensureTicking(); persistAllTimers_();
+}
+function pauseTimer(key, why){
+  const t = timers[key]; if (!t.running) return;
+  if (!t.paused){
+    t.accMs += (Date.now() - t.startMs);
+    t.paused = true; if (why==='state') t.pausedDueToState = true;
   } else {
-    checkTimer.paused = false; checkTimer.pausedDueToState = false; checkTimer.startMs = Date.now();
-    if (checkTimer.tickId) clearInterval(checkTimer.tickId);
-    checkTimer.tickId = setInterval(()=>{ updateCheckTimerUI(); if (!checkTimer.paused) persistTimer_(); }, 1000);
-    const tm = el('timerMsg'); if (tm) tm.textContent = 'Resumed.';
+    t.paused = false; t.pausedDueToState = false; t.startMs = Date.now();
   }
-  updateCheckTimerUI(); persistTimer_();
+  updateTimerDisplay(key); persistAllTimers_();
 }
-function resumeCheckTimerAuto(){
-  if ((checkTimer.paused && checkTimer.pausedDueToState) || (!checkTimer.running && checkTimer.accMs>0)){
-    checkTimer.running = true; checkTimer.paused = false; checkTimer.pausedDueToState = false; checkTimer.startMs = Date.now();
-    if (checkTimer.tickId) clearInterval(checkTimer.tickId);
-    checkTimer.tickId = setInterval(()=>{ updateCheckTimerUI(); if (!checkTimer.paused) persistTimer_(); }, 1000);
-    const tm = el('timerMsg'); if (tm) tm.textContent = 'Resumed (back to Working).';
-    updateCheckTimerUI(); persistTimer_();
-  }
+function endTimer(key, reason){
+  const t = timers[key];
+  const ms = totalMs(t);
+  t.running=false; t.paused=false; t.pausedDueToState=false; t.startMs=0;
+  updateTimerDisplay(key); persistAllTimers_();
+  const mins = Math.round(ms/60000);
+  if (mins>0){ const dur = el(`duration-${key}`); if (dur) dur.value = String(mins); }
 }
-function endCheckTimer(reason){
-  const total = checkTimer.accMs + (checkTimer.running && !checkTimer.paused ? (Date.now()-checkTimer.startMs) : 0);
-  if (checkTimer.tickId) clearInterval(checkTimer.tickId); checkTimer.tickId = null;
-  checkTimer.running = false; checkTimer.paused = false; checkTimer.pausedDueToState = false;
-
-  const mins = Math.round(total / 60000);
-  const msg = el('timerMsg');
-  if (mins > 0) { const d=el('duration'); if (d) d.value = String(mins); if (msg) msg.textContent = `Timer ended${reason?` (${reason})`:''}. ${mins} minute(s) populated.`; }
-  else { if (msg) msg.textContent = `Timer ended${reason?` (${reason})`:''}. Under 1 minute — please enter manually if needed.`; }
-  checkTimer.accMs = 0; updateCheckTimerUI(); persistTimer_();
+function resetTimer(key){
+  const t = timers[key]; if (!t) return;
+  t.running=false; t.startMs=0; t.accMs=0; updateTimerDisplay(key); persistAllTimers_();
 }
-
-/* ---------- reconcile ---------- */
-function reconcileFromServer(){
-  google.script.run.withSuccessHandler(s=>{
-    if (!s) return;
-    if (s.state && s.state !== currentState) {
-      const prev = currentState;
-      if (prev==='Working' && s.state!=='Working' && checkTimer.running && !checkTimer.paused){ pauseCheckTimer('state'); }
-      if (prev!=='Working' && s.state==='Working'){ resumeCheckTimerAuto(); }
-      paintState(s.state);
-      sinceTs = s.since_iso ? Date.parse(s.since_iso) : Date.now();
-      startStateTimer();
+function pauseAllRunningTimers(why){ TIMER_KEYS.forEach(k=>{ if (timers[k].running && !timers[k].paused) pauseTimer(k, why); }); }
+function resumeTimersPausedByState(){
+  TIMER_KEYS.forEach(k=>{
+    const t = timers[k];
+    if ((t.paused && t.pausedDueToState) || (!t.running && t.accMs>0 && t.pausedDueToState)){
+      t.running=true; t.paused=false; t.pausedDueToState=false; t.startMs=Date.now();
+      updateTimerDisplay(k); persistAllTimers_();
     }
-  }).getTodaySummary();
+  });
+}
+function wireTimerControls(k){
+  el(`btnStart-${k}`)?.addEventListener('click', ()=> startTimer(k));
+  el(`btnPause-${k}`)?.addEventListener('click', ()=> pauseTimer(k));
+  el(`btnEnd-${k}`)?.addEventListener('click', ()=> endTimer(k,'ended by user'));
+  el(`btnReset-${k}`)?.addEventListener('click', ()=> resetTimer(k));
+  el(`btnLog-${k}`)?.addEventListener('click', ()=> logTimerCheck(k));
+
+  // sticky note per timer (silent persistence)
+  const noteEl = el(`note-${k}`);
+  if (noteEl){
+    noteEl.value = getSavedLabel(k);
+    noteEl.addEventListener('blur', ()=> saveLabel(k, noteEl.value));
+    noteEl.addEventListener('keydown', (e)=>{ if (e.key==='Enter'){ saveLabel(k, noteEl.value); noteEl.blur(); } });
+  }
+}
+function wireTimerTabs(){
+  TIMER_KEYS.forEach(k=>{
+    el(`timerTab${k}`)?.addEventListener('click', ()=>{
+      activeTimerTab = k;
+      TIMER_KEYS.forEach(x=>{
+        el(`timerTab${x}`)?.classList.toggle('active', x===k);
+        el(`timerPanel${x}`)?.classList.toggle('hidden', x!==k);
+      });
+    });
+  });
 }
 
-/* ---------- Exceptions modal (wiring already in your FlowUI) ---------- */
+/* ---------- Log timer → CHECK (silent, queued, optimistic) ---------- */
+function logTimerCheck(key){
+  const type = (el(`checkType-${key}`) || {}).value;
+  const caseId = ((el(`caseId-${key}`) || {}).value || '').trim();
+  const minutes = Number((el(`duration-${key}`) || {}).value);
+  const note = ((el(`note-${key}`) || {}).value || '').trim();
+
+  if (!caseId || !minutes || minutes <= 0) return; // silent ignore
+
+  // Optimistic clear UI
+  const t = timers[key];
+  t.running=false; t.paused=false; t.pausedDueToState=false; t.startMs=0; t.accMs=0;
+  updateTimerDisplay(key); persistAllTimers_();
+  (el(`caseId-${key}`)||{}).value='';
+  (el(`duration-${key}`)||{}).value='';
+  const noteEl = el(`note-${key}`); if (noteEl) noteEl.value = '';
+  clearLabel(key);
+
+  // queue write
+  queue.enqueue('completeCheck', (ok, err)=>{
+    google.script.run
+      .withSuccessHandler(()=> ok())
+      .withFailureHandler(()=> ok())
+      .completeCheck(SESSION_TOKEN, type, caseId, minutes, note, '');
+  });
+}
+
+/* ======================================================================
+ * PROFILE + EXCEPTIONS (silent)
+ * ====================================================================== */
+function initials(s){ s=String(s||'').trim(); if(!s) return '•'; if (s.includes('@')) return s[0].toUpperCase(); const p=s.split(/\s+/).filter(Boolean); return p.length>1 ? (p[0][0]+p[1][0]).toUpperCase() : p[0][0].toUpperCase(); }
+function showProfModal(show){ el('profBackdrop').style.display=show?'block':'none'; el('profModal').style.display=show?'flex':'none'; }
+function loadProfile(){
+  google.script.run
+    .withSuccessHandler(p=>{
+      el('profName').value = p?.name || '';
+      el('profTeam').value = p?.team || '';
+      el('profHours').value = (p?.baseline_hours ?? 7.5);
+    })
+    .getMyProfile();
+}
+function saveProfile(){
+  const payload = { name:el('profName').value, team:el('profTeam').value, baseline_hours:Number(el('profHours').value) };
+  queue.enqueue('saveProfile', (ok)=>{ google.script.run.withSuccessHandler(()=>ok()).withFailureHandler(()=>ok()).saveMyProfile(payload); });
+}
+function mountProfileButton(){
+  const mount = el('profileMount'); if (!mount) return;
+  google.script.run
+    .withSuccessHandler(p=>{
+      const label = p?.name || p?.analyst_id || 'Me';
+      mount.innerHTML = `
+        <button id="profBtn" class="profile-btn" title="My Profile">
+          <span class="avatar" aria-hidden="true">${initials(label)}</span>
+          <span>${(p?.name || 'My Profile')}</span>
+        </button>`;
+      el('profBtn').addEventListener('click', ()=>{ showProfModal(true); loadProfile(); });
+    })
+    .withFailureHandler(()=>{
+      mount.innerHTML = `
+        <button id="profBtn" class="profile-btn" title="My Profile">
+          <span class="avatar" aria-hidden="true">•</span>
+          <span>My Profile</span>
+        </button>`;
+      el('profBtn').addEventListener('click', ()=>{ showProfModal(true); loadProfile(); });
+    })
+    .getMyProfile();
+}
+function wireProfileModal(){
+  el('profCancel')?.addEventListener('click', ()=> showProfModal(false));
+  el('profBackdrop')?.addEventListener('click', ()=> showProfModal(false));
+  el('profSave')?.addEventListener('click', saveProfile);
+}
+
+/* ======================================================================
+ * EXCEPTIONS (silent)
+ * ====================================================================== */
 function todayISO(){ return toISODate(new Date()); }
 function timeHM(d=new Date()){ const pad=n=>String(n).padStart(2,'0'); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; }
 function openExceptionModal(){
-  const now = new Date();
-  const start = new Date(now.getTime()-5*60000);
-  const end = new Date(now.getTime()+25*60000);
+  const now = new Date(); const start = new Date(now.getTime()-5*60000); const end = new Date(now.getTime()+25*60000);
   const date = el('excDate'); if (date) date.value = todayISO();
   const s = el('excStart'); if (s) s.value = timeHM(start);
   const e = el('excEnd'); if (e) e.value = timeHM(end);
-  const c = el('excCategory'); if (c) c.value = '';
-  const r = el('excReason'); if (r) r.value = '';
-  const info = el('excInfo'); if (info) info.textContent = 'Use this to notify your Team Lead about system issues, appointments or other exceptions.';
-  const b = el('exceptionBackdrop'); const m = el('exceptionModal');
-  if (b) b.classList.add('show'); if (m){ m.classList.add('show'); m.setAttribute('aria-hidden','false'); }
+  (el('excCategory')||{}).value=''; (el('excReason')||{}).value='';
+  $('#exceptionBackdrop')?.classList.add('show');
+  $('#exceptionModal')?.classList.add('show');
+  $('#exceptionModal')?.setAttribute('aria-hidden','false');
 }
 function closeExceptionModal(){
-  const b = el('exceptionBackdrop'); const m = el('exceptionModal');
-  if (b) b.classList.remove('show'); if (m){ m.classList.remove('show'); m.setAttribute('aria-hidden','true'); }
+  $('#exceptionBackdrop')?.classList.remove('show');
+  $('#exceptionModal')?.classList.remove('show');
+  $('#exceptionModal')?.setAttribute('aria-hidden','true');
 }
 function submitException(){
   const date_iso = (el('excDate')||{}).value;
   const start_hm = (el('excStart')||{}).value;
-  const end_hm = (el('excEnd')||{}).value;
+  const end_hm = (el('excEnd') ||{}).value;
   const category = (el('excCategory')||{}).value;
   const reason = ((el('excReason')||{}).value||'').trim();
-  const msg = el('excMsg');
-
-  if (!date_iso || !start_hm || !end_hm){ if (msg) msg.textContent='Date, start and end are required.'; return; }
-  if (!category){ if (msg) msg.textContent='Please choose a category.'; return; }
-
+  if (!date_iso || !start_hm || !end_hm || !category) return; // silent
   const start_ts = `${date_iso}T${start_hm}:00`;
   const end_ts = `${date_iso}T${end_hm}:00`;
   const payload = { token: SESSION_TOKEN, date_iso, start_ts, end_ts, category, reason };
-
-  const btn = el('excSubmit'); setBtnLoading(btn, 'Sending…'); if (msg) msg.textContent='';
-  google.script.run
-    .withSuccessHandler(function(res){
-      clearBtnLoading(btn, 'Send');
-      if (msg) msg.textContent = `Sent ✔ Ref: ${res && res.ref ? res.ref : '—'}`;
-      setTimeout(closeExceptionModal, 600);
-      // Refresh the summary so Exceptions show in Quick Glance immediately
-      refreshSummary();
-    })
-    .withFailureHandler(function(err){
-      clearBtnLoading(btn, 'Send');
-      console.error('Exception send failed:', err);
-      if (msg) msg.textContent = 'Failed to send: ' + (err && err.message || err || 'Unknown error');
-    })
-    .Notifications_createExceptionNotification(payload);
+  queue.enqueue('exception', (ok)=>{ google.script.run.withSuccessHandler(()=>{ ok(); closeExceptionModal(); }).withFailureHandler(()=>{ ok(); closeExceptionModal(); }).Notifications_createExceptionNotification(payload); });
 }
 
-/* ---------- init handlers (safe-boot) ---------- */
-function wireHandlersOnce_(){
-  if (window.__WIRED__) return;
-  window.__WIRED__ = true;
+/* ======================================================================
+ * QUICK GLANCE (uses backend summary; silent UI)
+ * ====================================================================== */
+function mmToHoursMinutes(mm){ const m=Math.max(0,Math.round(mm||0)), h=Math.floor(m/60), r=m%60; return `${h}h ${r}m`; }
+function renderQuickGlance(base, ex) {
+  const date = base?.date || toISODate(new Date());
+  const meeting = Number(base?.meeting_mins || 0);
 
-  const btnReg = el('btnRegister');
-  if (btnReg) btnReg.addEventListener('click', () => {
-    const b=el('btnRegister'); setBtnLoading(b,'Starting…');
+  const exMins = Number(
+    (base && base.exception_mins != null) ? base.exception_mins : (ex?.minutes || 0)
+  );
+
+  const startHM = (document.getElementById('workStart')?.value || '').trim();
+  const endHM = (document.getElementById('workEnd')?.value || '').trim();
+  const lunch = Number(document.getElementById('workLunch')?.value) || 0;
+
+  function hmToMinutes(hm){
+    const m = /^(\d{1,2}):(\d{2})$/.exec(hm||'');
+    if (!m) return null;
+    return Number(m[1])*60 + Number(m[2]);
+  }
+  const sMin = hmToMinutes(startHM), eMin = hmToMinutes(endHM);
+  const plannedMins = (sMin!=null && eMin!=null && eMin > sMin)
+    ? Math.max(0, (eMin - sMin) - lunch)
+    : 450; // default 7.5h
+
+  const workingNet = Math.max(0, plannedMins - meeting - exMins);
+
+  const uiState = currentState || base?.state || 'Idle';
+
+  const items = Array.isArray(ex?.items) ? ex.items : [];
+  let exListHtml = '';
+  if (items.length) {
+    const fmtHM = (iso) => {
+      const d = new Date(iso);
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    };
+    exListHtml =
+      '<div style="margin-top:6px">' +
+      items.slice(0, 3).map(i => {
+        const when = i.start_ts && i.end_ts
+          ? `${fmtHM(i.start_ts)}–${fmtHM(i.end_ts)}`
+          : (i.minutes ? `${i.minutes}m` : '');
+        const ref = i.ref ? `<code>${i.ref}</code>` : '';
+        return `<div class="small">• ${i.category || 'Exception'} ${ref} ${when ? '· ' + when : ''}</div>`;
+      }).join('') +
+      (items.length > 3 ? `<div class="small muted">+ ${items.length - 3} more…</div>` : '') +
+      '</div>';
+  }
+
+  const box = el('sumBox');
+  if (box) {
+    box.innerHTML = `
+      <div>Date: <b>${date}</b></div>
+      <div>Accepted meetings: <b>${mmToHoursMinutes(meeting)}</b></div>
+      <div>Exceptions today: <b>${mmToHoursMinutes(exMins)}</b></div>
+      <div>Working hours (plan − meetings − exceptions): <b>${mmToHoursMinutes(workingNet)}</b></div>
+      <hr/>
+      <div>Checks logged today: <b>${base?.output_total || 0}</b></div>
+      <div>State now: <b>${uiState}</b></div>
+      ${exListHtml}
+    `;
+  }
+}
+function fetchExceptionsForToday(cb){
+  const today = toISODate(new Date());
+  google.script.run
+    .withSuccessHandler(function(r){
+      if (r && typeof r.minutes === 'number' && Array.isArray(r.items)) { cb({ minutes:r.minutes, items:r.items }); return; }
+      if (Array.isArray(r)) { const m=r.reduce((acc,x)=> acc + Math.max(0, Number(x.minutes||0)),0); cb({ minutes:m, items:r }); return; }
+      cb({ minutes:0, items:[] });
+    })
+    .withFailureHandler(function(){ cb({ minutes:0, items:[] }); })
+    .getMyExceptionsForDate(today);
+}
+function refreshSummary(){
+  const btn = el('btnRefresh');
+  setBtnLoading(btn,'Refreshing…');
+  const bail = setTimeout(()=> clearBtnLoading(btn,'Refresh'), 8000);
+
+  google.script.run
+    .withSuccessHandler(function(base){
+      const serverState = base && base.state ? base.state : null;
+      const serverSince = base && base.since_iso ? base.since_iso : null;
+
+      let chosenState = currentState;
+
+      if (isOptimisticActive()) {
+        chosenState = __stateOptimistic || currentState;
+      } else if (serverChangeIsNewerOrMatching(serverState, serverSince)) {
+        chosenState = serverState || currentState;
+        if (serverSince) sinceTs = Date.parse(serverSince);
+      }
+
+      if (chosenState !== currentState) {
+        const prev = currentState;
+        if (prev === 'Working' && chosenState !== 'Working') pauseAllRunningTimers('state');
+        if (prev !== 'Working' && chosenState === 'Working') resumeTimersPausedByState();
+        paintState(chosenState);
+      }
+      startStateSinceTimer();
+
+      if (isOptimisticActive() && serverState === __stateOptimistic) {
+        __stateOptimistic = null;
+        __stateOptimisticUntil = 0;
+      }
+
+      fetchExceptionsForToday(function(ex){
+        try {
+          const safeBase = Object.assign({}, base || {});
+          safeBase.state = chosenState;
+          renderQuickGlance(safeBase, ex);
+        } catch(_) {}
+
+        clearTimeout(bail);
+        clearBtnLoading(btn,'Refresh');
+      });
+    })
+    .withFailureHandler(function(){
+      clearTimeout(bail);
+      clearBtnLoading(btn,'Refresh');
+    })
+    .getTodaySummary();
+}
+
+/* ======================================================================
+ * OVERLAY (Insights Drawer) + SEARCH BARS
+ * ====================================================================== */
+function openInsights(){
+  el('insightsBackdrop')?.classList.add('show');
+  el('insightsDrawer')?.classList.add('show');
+  el('insightsBackdrop')?.setAttribute('aria-hidden','false');
+  el('insightsDrawer')?.setAttribute('aria-hidden','false');
+  const activeTab = document.querySelector('.insights-tab.active')?.dataset.tab || 'calendar';
+  renderInsightsTab(activeTab);
+}
+function closeInsights(){
+  el('insightsBackdrop')?.classList.remove('show');
+  el('insightsDrawer')?.classList.remove('show');
+  el('insightsBackdrop')?.setAttribute('aria-hidden','true');
+  el('insightsDrawer')?.setAttribute('aria-hidden','true');
+}
+function wireInsightsDrawer(){
+  el('btnInsights')?.addEventListener('click', openInsights);
+  el('insightsClose')?.addEventListener('click', closeInsights);
+  el('insightsBackdrop')?.addEventListener('click', closeInsights);
+
+  $$('.insights-tab').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const tab = btn.dataset.tab;
+      $$('.insights-tab').forEach(b=>b.classList.toggle('active', b===btn));
+      $$('.insights-panel').forEach(p=> p.classList.toggle('active', p.id === `panel-${tab}`));
+      renderInsightsTab(tab);
+    });
+  });
+
+  // wire existing bars (no duplication)
+  wireCalendarBar();
+  wireStatsBar();
+}
+
+/* Calendar bar: default to TODAY */
+function wireCalendarBar(){
+  const inp = el('insCalDate');
+  const go = el('insCalGo');
+  const todayBtn = el('insCalToday');
+  if (inp && !inp.value) inp.value = todayLocalISO();
+  if (go) go.addEventListener('click', renderAgentCalendar);
+  if (todayBtn) todayBtn.addEventListener('click', ()=>{ if (inp) inp.value = todayLocalISO(); renderAgentCalendar(); });
+  if (inp) inp.addEventListener('change', renderAgentCalendar);
+}
+
+/* Stats bar: default to yesterday, supports range */
+function wireStatsBar(){
+  const host = document.getElementById('panel-stats');
+  if (!host) return;
+
+  const from = document.getElementById('insStatsFrom');
+  const to = document.getElementById('insStatsTo');
+  const go = document.getElementById('insStatsGo');
+  const week = document.getElementById('insStatsWeek');
+  const month= document.getElementById('insStatsMonth');
+
+  const today = new Date();
+  const y = new Date(today); y.setDate(today.getDate()-1);
+  const yISO = (d=>{ d.setMinutes(d.getMinutes()-d.getTimezoneOffset()); return d.toISOString().slice(0,10); })(y);
+  if (from && !from.value) from.value = yISO;
+  if (to && !to.value) to.value = yISO;
+
+  const render = ()=> renderAgentStats();
+
+  go && go.addEventListener('click', render);
+  from && from.addEventListener('change', render);
+  to && to.addEventListener('change', render);
+
+  week && week.addEventListener('click', ()=>{
+    const end = new Date(); end.setDate(end.getDate()-1);
+    const start = new Date(end); start.setDate(end.getDate()-6);
+    const iso = d=>{ d.setMinutes(d.getMinutes()-d.getTimezoneOffset()); return d.toISOString().slice(0,10); };
+    if (from) from.value = iso(start);
+    if (to) to.value = iso(end);
+    render();
+  });
+
+  month && month.addEventListener('click', ()=>{
+    const end = new Date(); end.setDate(end.getDate()-1);
+    const start = new Date(end); start.setDate(end.getDate()-29);
+    const iso = d=>{ d.setMinutes(d.getMinutes()-d.getTimezoneOffset()); return d.toISOString().slice(0,10); };
+    if (from) from.value = iso(start);
+    if (to) to.value = iso(end);
+    render();
+  });
+}
+
+function renderInsightsTab(tab){
+  if (tab === 'calendar') return renderAgentCalendar();
+  if (tab === 'stats') return renderAgentStats();
+}
+
+/* ---------- Calendar renderer (widget) ---------- */
+function renderAgentCalendar(){
+  const calMount = document.getElementById('agentCalBox');
+  if (!calMount) return;
+  const inp = document.getElementById('insCalDate');
+  const dayISO = (inp && inp.value) ? inp.value : todayLocalISO();
+
+  calMount.innerHTML = '<div class="small">Loading…</div>';
+
+  if (window.renderInsightsCalendarAndStates) {
+    window.renderInsightsCalendarAndStates(calMount, dayISO, dayISO);
+  } else {
+    calMount.innerHTML = '<div class="small" style="color:#b91c1c">Widget not loaded (insights.widget)</div>';
+  }
+}
+
+/* ---------- Stats renderer (reads backend stats; current day shows —) ---------- */
+function renderAgentStats(){
+  const mount = document.getElementById('agentStatsBox');
+  if (!mount) return;
+
+  const from = document.getElementById('insStatsFrom')?.value || yesterdayISO();
+  const to = document.getElementById('insStatsTo')?.value || from;
+
+  mount.innerHTML = '<div class="small">Loading…</div>';
+
+  google.script.run
+    .withSuccessHandler(res=>{
+      const rows = Array.isArray(res?.rows) ? res.rows : [];
+      const clippedTo = res?.skippedAfter;
+
+      const sum = rows.reduce((a,r)=>({
+        working:a.working + (r.working_mins||0),
+        admin: a.admin + (r.admin_mins||0),
+        idle: a.idle + (r.idle_mins||0),
+        meet: a.meet + (r.meeting_mins||0),
+        exc: a.exc + (r.exception_mins||0),
+        checks: a.checks + (r.checks_count||0),
+        checkMin: a.checkMin + (r.check_minutes||0)
+      }), {working:0, admin:0, idle:0, meet:0, exc:0, checks:0, checkMin:0});
+
+      const utilisation = sum.working > 0 ? Math.min(100, (sum.checkMin / sum.working)*100) : null;
+      const pace = null;
+      const adherence = null;
+      const tph = sum.working > 0 ? (sum.checks / (sum.working/60)) : 0;
+
+      function fmtPct(x){ return (x==null) ? '—' : Math.max(0,Math.min(100,Math.round(x)))+'%'; }
+      function fmt2(x){ return Number.isFinite(x) ? x.toFixed(2) : '0.00'; }
+
+      const note = (clippedTo && to >= clippedTo)
+        ? `<div class="small" style="color:#6b7280;margin:6px 0 0">Stats for today/future are excluded. Data is available the day after.</div>`
+        : '';
+
+      mount.innerHTML = `
+        <div class="row" style="gap:8px; flex-wrap:wrap;">
+          <div class="card" style="flex:1; min-width:160px;"><div class="small">From</div><b>${from}</b></div>
+          <div class="card" style="flex:1; min-width:160px;"><div class="small">To</div><b>${to}</b></div>
+          <div class="card" style="flex:1; min-width:160px;"><div class="small">Checks</div><b>${sum.checks}</b></div>
+          <div class="card" style="flex:1; min-width:160px;"><div class="small">PACE</div><b>${fmtPct(pace)}</b></div>
+          <div class="card" style="flex:1; min-width:160px;"><div class="small">Utilisation</div><b>${fmtPct(utilisation)}</b></div>
+          <div class="card" style="flex:1; min-width:160px;"><div class="small">Adherence</div><b>${fmtPct(adherence)}</b></div>
+          <div class="card" style="flex:1; min-width:160px;"><div class="small">Throughput/hr</div><b>${fmt2(tph)}</b></div>
+        </div>
+        <div class="small" style="margin-top:6px; color:#6b7280">
+          Working mins: ${sum.working} · Admin mins: ${sum.admin} · <b>Checks mins:</b> ${sum.checkMin} · Meetings: ${sum.meet}
+        </div>
+        ${note}
+      `;
+    })
+    .withFailureHandler(err=>{
+      mount.innerHTML = `<span class="warn">Stats error: ${(err && err.message)||err}</span>`;
+    })
+    .getAnalystDailyRange(from, to);
+}
+
+/* ======================================================================
+ * WINDOW + GLOBAL WIRING
+ * ====================================================================== */
+let minimized = false;
+function wireWindowControls(){
+  const btnMin = el('btnMin');
+  if (btnMin) btnAddEvent(btnMin, 'click', () => {
+    minimized = !minimized;
+    const c = el('content'); if (c) c.classList.toggle('hidden', minimized);
+    try { google.script.host.setHeight(minimized?60:720); google.script.host.setWidth(minimized?360:520); } catch(_){}
+  });
+
+  function btnAddEvent(node, type, cb){ node.addEventListener(type, cb); }
+
+  const btnPop = el('btnPop');
+  if (btnPop) btnPop.addEventListener('click', () => {
+    google.script.run.withSuccessHandler(cfg => {
+      if (cfg && cfg.web_app_url) window.open(cfg.web_app_url, '_blank');
+    }).getClientConfig();
+  });
+
+  const btnLogOff = el('btnLogOff');
+  if (btnLogOff) btnLogOff.addEventListener('click', () => {
+    setBtnLoading(btnLogOff, '…');
+    queue.enqueue('logOff', (ok)=>{
+      google.script.run.withSuccessHandler(()=>{ clearBtnLoading(btnLogOff,'⏻'); ok(); }).withFailureHandler(()=>{ clearBtnLoading(btnLogOff,'⏻'); ok(); }).logOff(SESSION_TOKEN,'User pressed Log Off');
+    });
+    paintState('LoggedOut'); sinceTs = Date.now(); startStateSinceTimer();
+  });
+
+  window.addEventListener('beforeunload', () => {
+    persistAllTimers_();
+    try{ google.script.run.logOff(SESSION_TOKEN,'Window closed'); }catch(_){}
+  });
+}
+
+/* ---------- Global shortcuts ---------- */
+function wireGlobalShortcuts(){
+  el('btnRefresh')?.addEventListener('click', refreshSummary);
+  document.addEventListener('visibilitychange', ()=>{ if (document.visibilityState === 'visible') refreshSummary(); });
+  window.addEventListener('focus', refreshSummary);
+
+  el('btnAddException')?.addEventListener('click', openExceptionModal);
+  el('excCancel')?.addEventListener('click', closeExceptionModal);
+  el('exceptionBackdrop')?.addEventListener('click', closeExceptionModal);
+  el('excSubmit')?.addEventListener('click', submitException);
+}
+
+/* ---------- Calendar sync (silent) ---------- */
+function wireCalendarSync(){
+  const btnSync = el('btnSyncToday'); if (!btnSync) return;
+  btnSync.addEventListener('click', ()=>{
+    const today = todayLocalISO();
+    setBtnLoading(btnSync,'…');
+    queue.enqueue('syncCal', (ok)=> {
+      google.script.run.withSuccessHandler(()=>{ clearBtnLoading(btnSync,'Sync My Calendar (Today)'); ok(); })
+        .withFailureHandler(()=>{ clearBtnLoading(btnSync,'Sync My Calendar (Today)'); ok(); })
+        .syncMyCalendarForDate(null, today);
+    });
+  });
+}
+
+/* ---------- Minimal init painting ---------- */
+function onInitMinimal(d){
+  try{
+    const who = el('who'); if (who && d?.analyst_id) who.textContent = ' · ' + d.analyst_id;
+
+    if (Array.isArray(d?.states)) window.__ALL_STATES = d.states;
+    const st = d?.state_info?.state || 'Idle';
+    paintState(st);
+    sinceTs = d?.state_info?.since_iso ? Date.parse(d.state_info.since_iso) : Date.now();
+    startStateSinceTimer();
+
+    // check types
+    const opts = (d?.check_types||[]).map(c=>`<option value="${c.name}">${c.name}</option>`).join('');
+    TIMER_KEYS.forEach(k=>{ const sel = el(`checkType-${k}`); if (sel) sel.innerHTML = opts; });
+
+    // Only paint plan if backend actually provided values (do NOT clear)
+    const planCandidate = d?.work_plan_today || (d?.location_today ? { location:d.location_today } : null);
+    if (planCandidate && (planCandidate.location || planCandidate.start_hm || planCandidate.end_hm || planCandidate.lunch_minutes != null)){
+      populateWorkingLocationUI(planCandidate);
+    }
+  }catch(_){}
+}
+
+/* ---------- Register / session ---------- */
+function wireCoreHandlers(){
+  const btnReg = el('btnRegister'); if (!btnReg) return;
+  btnReg.addEventListener('click', () => {
+    setBtnLoading(btnReg,'Starting…');
     google.script.run
       .withSuccessHandler(d=>{
         SESSION_TOKEN = d.token;
         const who = el('who'); if (who) who.textContent = ' · ' + d.analyst_id + ' (session started here)';
         if (d.states) window.__ALL_STATES = d.states;
-        if (d.check_types) { const ct = el('checkType'); if (ct) ct.innerHTML = d.check_types.map(c=>`<option value="${c.name}">${c.name}</option>`).join(''); }
+
+        const opts = (d.check_types||[]).map(c=>`<option value="${c.name}">${c.name}</option>`).join('');
+        TIMER_KEYS.forEach(k=>{ const sel = el(`checkType-${k}`); if (sel) sel.innerHTML = opts; });
+
         if (d.state_info){
           paintState(d.state_info.state || 'Idle');
           sinceTs = d.state_info.since_iso ? Date.parse(d.state_info.since_iso) : Date.now();
-          startStateTimer();
-        }
-        clearBtnLoading(b,'Start / Register');
+        } else { paintState('Idle'); sinceTs = Date.now(); }
+        startStateSinceTimer();
+
+        loadTimers_(); updateAllDisplays(); ensureTicking();
+        if (currentState === 'Working') resumeTimersPausedByState();
+
+        clearBtnLoading(btnReg,'Start / Register');
         startHeartbeat();
         refreshSummary();
+
+        // load today plan on register (guard against empty)
+        const day = todayLocalISO();
+        google.script.run.withSuccessHandler(res=>{
+          const plan = res?.plan;
+          if (plan && (plan.location || plan.start_hm || plan.end_hm || plan.lunch_minutes != null)){
+            populateWorkingLocationUI(plan);
+          }
+        }).getMyWorkPlan(day);
       })
-      .withFailureHandler(e=>{
-        alert(e && e.message ? e.message : e);
-        clearBtnLoading(b,'Start / Register');
-      })
+      .withFailureHandler(()=>{ clearBtnLoading(btnReg,'Start / Register'); })
       .registerMeTakeover('', '');
   });
-
-  const btnSaveBaseline = el('btnSaveBaseline');
-  if (btnSaveBaseline) btnSaveBaseline.addEventListener('click', () => {
-    const btn=el('btnSaveBaseline'); setBtnLoading(btn,'Saving…');
-    const hrs=Number((el('baselineHours')||{}).value);
-    google.script.run.withSuccessHandler(d=>{
-      const m=el('baselineMsg'); if (m) m.innerHTML=`<span class="ok">Saved ${d.hours}h.</span>`;
-      clearBtnLoading(btn,'Save'); refreshSummary();
-    }).withFailureHandler(e=>{
-      const m=el('baselineMsg'); if (m) m.innerHTML=`<span class="warn">${e.message}</span>`;
-      clearBtnLoading(btn,'Save');
-    }).updateMyBaselineHours(hrs);
-  });
-
-  const badge = el('stateBadge');
-  if (badge) badge.addEventListener('click', ()=>{
-    if (!window.__ALL_STATES || !__ALL_STATES.length) return;
-    showStateMenu(__ALL_STATES);
-  });
-  const menu = stateMenu();
-  if (menu) menu.addEventListener('click', (e)=>{
-    const btn = e.target.closest('button[data-state]');
-    if (!btn) return;
-    const newState = btn.getAttribute('data-state');
-    hideStateMenu();
-    const prev = currentState;
-    const msg = el('stateMsg'); if (msg) msg.textContent='Setting state…';
-    google.script.run.withSuccessHandler(d=>{
-      const m=el('stateMsg'); if (m) m.innerHTML=`<span class="ok">State set: ${d.state} @ ${new Date(d.ts).toLocaleTimeString()}</span>`;
-      if (prev==='Working' && d.state!=='Working' && checkTimer.running && !checkTimer.paused){ pauseCheckTimer('state'); }
-      if (prev!=='Working' && d.state==='Working'){ resumeCheckTimerAuto(); }
-      paintState(d.state); sinceTs = Date.parse(d.ts) || Date.now(); startStateTimer();
-      refreshSummary();
-    }).withFailureHandler(e=>{
-      const m=el('stateMsg'); if (m) m.innerHTML=`<span class="warn">${e.message}</span>`;
-    }).setState(SESSION_TOKEN, newState, '');
-  });
-
-  const btnSaveLocation = el('btnSaveLocation');
-  if (btnSaveLocation) btnSaveLocation.addEventListener('click', ()=>{
-    const loc = (el('workLocation')||{}).value;
-    if(!loc){ const lm=el('locMsg'); if (lm) lm.textContent='Select Home or Office'; return; }
-    if (!confirm(`Are you sure you want to set your Working location as "${loc}" for today?`)) return;
-    const btn=el('btnSaveLocation'); setBtnLoading(btn,'Saving…');
-    google.script.run.withSuccessHandler(d=>{
-      const lm=el('locMsg'); if (lm) lm.innerHTML = `<span class="ok">Saved ${d.location}.</span>`;
-      clearBtnLoading(btn,'Save');
-      const w=el('workLocation'); if (w) w.disabled = true; const b2=el('btnSaveLocation'); if (b2) b2.disabled = true;
-    }).withFailureHandler(e=>{
-      const lm=el('locMsg'); if (lm) lm.innerHTML = `<span class="warn">${e.message}</span>`;
-      clearBtnLoading(btn,'Save');
-      if ((e.message||'').includes('already set')) {
-        const w=el('workLocation'); if (w) w.disabled = true; const b2=el('btnSaveLocation'); if (b2) b2.disabled = true;
-      }
-    }).setMyLocationToday(loc);
-  });
-
-  const bStart = el('btnStartCheck'); if (bStart) bStart.addEventListener('click', startCheckTimer);
-  const bPause = el('btnPauseCheck'); if (bPause) bPause.addEventListener('click', () => { if (!checkTimer.running) return; pauseCheckTimer(); });
-  const bEnd = el('btnEndCheck'); if (bEnd) bEnd.addEventListener('click', ()=> endCheckTimer('ended by user'));
-
-  const btnLog = el('btnComplete');
-  if (btnLog) btnLog.addEventListener('click', () => {
-    const type=(el('checkType')||{}).value, caseId=((el('caseId')||{}).value||'').trim(), dur=Number((el('duration')||{}).value);
-    const cm=el('checkMsg');
-    if (!caseId){ if (cm) cm.innerHTML=`<span class="warn">Case ID is required.</span>`; return; }
-    if (!dur || dur<=0){ if (cm) cm.innerHTML=`<span class="warn">Minutes must be a positive number.</span>`; return; }
-    const btn=el('btnComplete'); setBtnLoading(btn,'Logging…');
-    google.script.run.withSuccessHandler(d=>{
-      if (cm) cm.innerHTML=`<span class="ok">Logged ${d.check_type} @ ${new Date(d.ts).toLocaleTimeString()} (state: ${d.state_at_log})</span>`;
-      const cid=el('caseId'); if (cid) cid.value=''; const du=el('duration'); if (du) du.value='';
-      checkTimer.running=false; checkTimer.paused=false; checkTimer.pausedDueToState=false;
-      if (checkTimer.tickId) clearInterval(checkTimer.tickId); checkTimer.tickId=null;
-      checkTimer.accMs=0; updateCheckTimerUI(); persistTimer_();
-      clearBtnLoading(btn,'Log');
-      refreshSummary();
-    }).withFailureHandler(e=>{
-      if (cm) cm.innerHTML=`<span class="warn">${e.message}</span>`;
-      clearBtnLoading(btn,'Log');
-    }).completeCheck(SESSION_TOKEN,type,caseId,dur,'','');
-  });
-
-  const btnSync = el('btnSyncToday');
-  if (btnSync) btnSync.addEventListener('click', () => {
-    const btn=el('btnSyncToday'); setBtnLoading(btn,'Syncing…');
-    google.script.run.withSuccessHandler(d=>{
-      const cm=el('calMsg'); if (cm) cm.innerHTML=`<span class="ok">Synced ${d.added} accepted, mapped events for today.</span>`;
-      clearBtnLoading(btn,'Sync My Calendar (Today)');
-      refreshSummary();
-    }).withFailureHandler(e=>{
-      const cm=el('calMsg'); if (cm) cm.innerHTML=`<span class="warn">${e.message}</span>`;
-      clearBtnLoading(btn,'Sync My Calendar (Today)');
-    }).syncMyCalendarForDate(SESSION_TOKEN, new Date().toISOString().slice(0,10));
-  });
-
-  const btnRef = el('btnRefresh'); if (btnRef) btnRef.addEventListener('click', refreshSummary);
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') refreshSummary(); });
-  window.addEventListener('focus', refreshSummary);
-  setInterval(reconcileFromServer, 10000);
-
-  /* Exceptions modal buttons */
-  const addEx = el('btnAddException'); if (addEx) addEx.addEventListener('click', openExceptionModal);
-  const exCancel = el('excCancel'); if (exCancel) exCancel.addEventListener('click', closeExceptionModal);
-  const exBack = el('exceptionBackdrop'); if (exBack) exBack.addEventListener('click', closeExceptionModal);
-  const exSend = el('excSubmit'); if (exSend) exSend.addEventListener('click', submitException);
 }
 
-/* ---------- init & enhanced summary (with Exceptions) ---------- */
-
-// Render “Quick Glance” with optional Exceptions
-function renderQuickGlance(base, ex){
-  // base: { date, meeting_mins, working_mins_calc, state, since_iso, output_total, baseline_hours }
-  // ex: { minutes: number, items: [{ref, category, start_ts, end_ts, minutes, reason}] }
-  const date = base?.date || toISODate(new Date());
-  const meeting = Number(base?.meeting_mins||0);
-  const workingBase = Number(base?.working_mins_calc||0);
-  const exMins = Number(ex?.minutes||0);
-
-  const workingNet = Math.max(0, workingBase - exMins);
-
-  let exListHtml = '';
-  const items = Array.isArray(ex?.items) ? ex.items : [];
-  if (items.length){
-    const fmtHM = (iso)=> {
-      try { const d = new Date(iso); return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); } catch(e){ return ''; }
-    };
-    exListHtml =
-      '<div style="margin-top:6px">' +
-        items.slice(0,3).map(i=>{
-          const when = i.start_ts && i.end_ts ? `${fmtHM(i.start_ts)}–${fmtHM(i.end_ts)}` : (i.minutes? `${i.minutes}m` : '');
-          const ref = i.ref ? `<code>${i.ref}</code>` : '';
-          return `<div class="small">• ${i.category||'Exception'} ${ref} ${when ? '· '+when : ''}</div>`;
-        }).join('') +
-        (items.length>3 ? `<div class="small muted">+ ${items.length-3} more…</div>` : '') +
-      '</div>';
-  }
-
-  const box = el('sumBox');
-  if (box){
-    box.innerHTML = `
-      <div>Date: <b>${date}</b></div>
-      <div>Accepted meetings (calendar): <b>${mmToHoursMinutes(meeting)}</b></div>
-      <div>Exceptions today: <b>${mmToHoursMinutes(exMins)}</b></div>
-      <div>Working hours (baseline − meetings − exceptions): <b>${mmToHoursMinutes(workingNet)}</b></div>
-      <hr/>
-      <div>Checks logged today: <b>${base?.output_total || 0}</b></div>
-      <div>State now: <b>${base?.state || 'Idle'}</b></div>
-      ${exListHtml}
-    `;
-  }
-}
-
-// --- Replace your existing fetchExceptionsForToday + refreshSummary with these ---
-
-// Fetch today’s exceptions if your server provides a list method.
-// If the server method doesn't exist or fails, we just return zeroes.
-
-function fetchExceptionsForToday(cb){
-  const today = toISODate(new Date());
-  google.script.run
-    .withSuccessHandler(function(r){
-      // Accept {minutes,items} or a raw array
-      if (r && typeof r.minutes === 'number' && Array.isArray(r.items)) {
-        cb({ minutes:r.minutes, items:r.items });
-        return;
-      }
-      if (Array.isArray(r)) {
-        const m = r.reduce((acc,x)=> acc + Math.max(0, Number(x.minutes||0)), 0);
-        cb({ minutes:m, items:r });
-        return;
-      }
-      cb({ minutes:0, items:[] });
-    })
-    .withFailureHandler(function(){
-      cb({ minutes:0, items:[] });
-    })
-    .getMyExceptionsForDate(today); // <- safe, always defined now
-}
-
-function refreshSummary(){
-  const btn = el('btnRefresh');
-  setBtnLoading(btn,'Refreshing…');
-
-  google.script.run
-    .withSuccessHandler(function(base){
-      fetchExceptionsForToday(function(ex){
-        renderQuickGlance(base || {}, ex);
-
-        // keep state/timer visuals
-        if (base && base.state){
-          if (currentState==='Working' && base.state!=='Working' && checkTimer.running && !checkTimer.paused){
-            pauseCheckTimer('state');
-          }
-          if (currentState!=='Working' && base.state==='Working'){
-            resumeCheckTimerAuto();
-          }
-          if (base.state !== currentState){
-            paintState(base.state);
-            sinceTs = base.since_iso ? Date.parse(base.since_iso) : Date.now();
-            startStateTimer();
-          }
-        }
-        clearBtnLoading(btn,'Refresh');
-      });
-    })
-    .withFailureHandler(function(e){
-      const box = el('sumBox');
-      if (box) box.innerHTML = `<span class="warn">Summary error: ${e && e.message || e}</span>`;
-      clearBtnLoading(btn,'Refresh');
-    })
-    .getTodaySummary(); // always exists
-}
-// Boot
-function onInit(data){
-  SESSION_TOKEN = data.token;
-  const who = el('who'); if (who) who.textContent = ' · ' + data.analyst_id;
-
-  window.__ALL_STATES = data.states || [];
-  const ct = el('checkType'); if (ct) ct.innerHTML = (data.check_types||[]).map(c=>`<option value="${c.name}">${c.name}</option>`).join('');
-  const bh = el('baselineHours'); if (bh) bh.value = data.baseline_hours || 8.5;
-
-  if (data.location_today) {
-    const w=el('workLocation'); if (w) w.value = data.location_today;
-    const lm=el('locMsg'); if (lm) lm.textContent = 'Saved ' + data.location_today;
-    const w2=el('workLocation'); if (w2) w2.disabled = true; const b2=el('btnSaveLocation'); if (b2) b2.disabled = true;
-  }
-
-  paintState(data.state_info && data.state_info.state ? data.state_info.state : 'Idle');
-  sinceTs = (data.state_info && data.state_info.since_iso) ? Date.parse(data.state_info.since_iso) : Date.now();
-  startStateTimer();
-
-  startHeartbeat();
-  refreshSummary();
-
-  const b=el('btnRegister'); clearBtnLoading(b,'Start / Register');
-  updateStartGate();
-}
-
+/* ---------- INIT ---------- */
 function init(){
-  wireHandlersOnce_();
-  const b=el('btnRegister'); setBtnLoading(b,'Starting…');
-  google.script.run
-    .withSuccessHandler(onInit)
-    .withFailureHandler(err=>{
-      console.error('Init failed:', err);
-      const who = el('who'); if (who) who.textContent = ' · not signed in';
-      clearBtnLoading(b,'Start / Register');
-    })
-    .getInitData();
+  // window chrome + modals
+  wireWindowControls();
+  wireProfileModal();
+  mountProfileButton();
+  wireWorkingLocation();
+  wireCalendarSync();
+  wireStateBadge();
+  wireCoreHandlers();
+  wireGlobalShortcuts();
+  wireInsightsDrawer();
 
-  loadTimer_();
-  updateCheckTimerUI();
+  // Load today's plan immediately (non-destructive)
+  loadAndApplyTodayPlan();
+
+  // timers
+  TIMER_KEYS.forEach(wireTimerControls);
+  wireTimerTabs();
+
+  // Restore timers
+  loadTimers_(); updateAllDisplays(); ensureTicking();
+
+  // Initial data (no register required)
+  google.script.run
+    .withSuccessHandler((d)=>{
+      onInitMinimal(d || {});
+      try{ refreshSummary(); }catch(e){}
+    })
+    .withFailureHandler(()=>{})
+    .getInitData();
 }
 
-// Reset any “loading” buttons if a global error hits
+/* ---------- global error: clear loading badges (silent) ---------- */
 window.addEventListener('error', () => {
-  ['btnRegister','btnSaveBaseline','btnComplete','btnSyncToday','btnRefresh','btnLogOff','btnSaveLocation','btnStartCheck','btnPauseCheck','btnEndCheck','excSubmit']
-    .map(el).filter(Boolean).forEach(b => b.classList.remove('loading'));
+  ['btnRegister','btnComplete','btnSyncToday','btnRefresh','btnLogOff','btnSaveLocation',
+   'btnStart-A','btnPause-A','btnEnd-A','btnReset-A','btnLog-A',
+   'btnStart-B','btnPause-B','btnEnd-B','btnReset-B','btnLog-B',
+   'btnStart-C','btnPause-C','btnEnd-C','btnReset-C','btnLog-C',
+   'btnStart-D','btnPause-D','btnEnd-D','btnReset-D','btnLog-D',
+   'excSubmit'
+  ].map(el).filter(Boolean).forEach(b => b.classList.remove('loading'));
   const br = el('btnRefresh'); if (br) br.textContent='Refresh';
-  const bs = el('btnSaveBaseline'); if (bs) bs.textContent='Save';
   const bl = el('btnSyncToday'); if (bl) bl.textContent='Sync My Calendar (Today)';
   const lg = el('btnLogOff'); if (lg) lg.textContent='⏻';
   const ex = el('excSubmit'); if (ex) ex.textContent='Send';
