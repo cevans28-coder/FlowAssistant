@@ -1,0 +1,142 @@
+/** =========================================================
+ * Profile_API.gs — Flow Assistant
+ * Lets an analyst view/update their own profile fields
+ * in the Analysts sheet: name, team, baseline hours.
+ * ========================================================= */
+
+function _prof_master_() {
+  if (typeof master_ === 'function') return master_();
+  const id = (typeof PropertiesService !== 'undefined')
+    ? PropertiesService.getScriptProperties().getProperty('MASTER_SHEET_ID')
+    : '';
+  return id ? SpreadsheetApp.openById(id) : SpreadsheetApp.getActiveSpreadsheet();
+}
+function _prof_normId_(s){ return String(s||'').replace(/\u00A0/g,' ').trim().toLowerCase(); }
+function _prof_idxLoose_(headers){
+  const m={};
+  (headers||[]).forEach((h,i)=>{
+    const k = String(h||'').toLowerCase().replace(/\s+/g,'_').replace(/[^a-z0-9_]/g,'');
+    m[k] = i;
+  });
+  return m;
+}
+function _prof_num(x, d){ x = Number(x); return Number.isFinite(x) ? x : (d==null?0:d); }
+function _prof_str(x){ return (x==null)? '' : String(x); }
+
+/** Get or create "Analysts" sheet */
+function _prof_sheetAnalysts_() {
+  const ss = _prof_master_();
+  const name = (typeof SHEETS==='object' && SHEETS && SHEETS.ANALYSTS) ? SHEETS.ANALYSTS : 'Analysts';
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.getRange(1,1,1,6).setValues([[
+      'analyst_id','name','team','baseline_hours','created_at','updated_at'
+    ]]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+/** Returns current signed-in user's email (lowercased) */
+function _prof_me_(){
+  try { return (Session.getActiveUser().getEmail() || '').toLowerCase(); }
+  catch(e){ return ''; }
+}
+
+/** Public: read my profile (creates a row on first call if none) */
+function getMyProfile(){
+  const me = _prof_me_();
+  if (!me) throw new Error('No signed-in user email.');
+
+  const sh = _prof_sheetAnalysts_();
+  const last = sh.getLastRow();
+  const vals = sh.getDataRange().getValues();
+  const idx = _prof_idxLoose_(vals[0]);
+
+  const cId = idx['analyst_id'] ?? idx['email'] ?? idx['id'];
+  const cName = idx['name'] ?? idx['display_name'] ?? null;
+  const cTeam = idx['team'] ?? idx['squad'] ?? idx['group'] ?? null;
+  const cBase = idx['baseline_hours'] ?? idx['contracted_hours'] ?? idx['hours_per_day'] ?? null;
+
+  let rowIndex = -1;
+  for (let r=1; r<vals.length; r++){
+    const id = _prof_normId_(vals[r][cId]);
+    if (id === _prof_normId_(me)) { rowIndex = r+1; break; }
+  }
+
+  if (rowIndex === -1){
+    // create a minimal row
+    const now = new Date().toISOString();
+    const row = [me, '', '', 7.5, now, now];
+    sh.appendRow(row);
+    rowIndex = sh.getLastRow();
+    return { analyst_id: me, name:'', team:'', baseline_hours:7.5, row: rowIndex };
+  }
+
+  const row = sh.getRange(rowIndex,1,1,sh.getLastColumn()).getValues()[0];
+  const name = (cName!=null) ? _prof_str(row[cName]).trim() : '';
+  const team = (cTeam!=null) ? _prof_str(row[cTeam]).trim() : '';
+  const base = (cBase!=null) ? _prof_num(row[cBase], 7.5) : 7.5;
+
+  return { analyst_id: me, name, team, baseline_hours: base, row: rowIndex };
+}
+
+/** Public: update my profile fields (only mine; upsert-safe) */
+function saveMyProfile(payload){
+  const me = _prof_me_();
+  if (!me) throw new Error('No signed-in user email.');
+
+  payload = payload || {};
+  // Only allow writing to own row
+  if (payload.analyst_id && _prof_normId_(payload.analyst_id) !== _prof_normId_(me)) {
+    throw new Error('You can only update your own profile.');
+  }
+
+  const sh = _prof_sheetAnalysts_();
+  const last = sh.getLastRow();
+  const vals = sh.getDataRange().getValues();
+  const idx = _prof_idxLoose_(vals[0]);
+
+  const cId = idx['analyst_id'] ?? idx['email'] ?? idx['id'];
+  const cName = idx['name'] ?? idx['display_name'] ?? null;
+  const cTeam = idx['team'] ?? idx['squad'] ?? idx['group'] ?? null;
+  const cBase = idx['baseline_hours'] ?? idx['contracted_hours'] ?? idx['hours_per_day'] ?? null;
+  const cUpd = idx['updated_at'] ?? null;
+  const cNew = idx['created_at'] ?? null;
+
+  // Find row or add
+  let rowIndex = -1;
+  for (let r=1; r<vals.length; r++){
+    const id = _prof_normId_(vals[r][cId]);
+    if (id === _prof_normId_(me)) { rowIndex = r+1; break; }
+  }
+  if (rowIndex === -1){
+    const now = new Date().toISOString();
+    const row = [];
+    // Ensure at least first 6 columns if sheet is brand new
+    const minCols = Math.max(6, sh.getLastColumn());
+    for (let i=0;i<minCols;i++) row[i] = '';
+    row[cId] = me;
+    if (cName!=null) row[cName] = '';
+    if (cTeam!=null) row[cTeam] = '';
+    if (cBase!=null) row[cBase] = 7.5;
+    if (cNew!=null) row[cNew] = now;
+    if (cUpd!=null) row[cUpd] = now;
+    sh.appendRow(row);
+    rowIndex = sh.getLastRow();
+  }
+
+  // Patch requested fields
+  const now = new Date().toISOString();
+  const name = _prof_str(payload.name).trim();
+  const team = _prof_str(payload.team).trim();
+  const base = _prof_num(payload.baseline_hours, NaN);
+
+  if (cName!=null && payload.name!=null) sh.getRange(rowIndex, cName+1).setValue(name);
+  if (cTeam!=null && payload.team!=null) sh.getRange(rowIndex, cTeam+1).setValue(team);
+  if (cBase!=null && !Number.isNaN(base)) sh.getRange(rowIndex, cBase+1).setValue(base);
+  if (cUpd!=null) sh.getRange(rowIndex, cUpd+1).setValue(now);
+
+  return { ok:true, analyst_id: me, name, team, baseline_hours: Number.isNaN(base) ? undefined : base };
+}
